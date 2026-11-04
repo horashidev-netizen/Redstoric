@@ -1,2 +1,4 @@
 /target
-assets/placeholders/
+assets/placeholders/glb/**
+dump_code.py
+project_dump.md

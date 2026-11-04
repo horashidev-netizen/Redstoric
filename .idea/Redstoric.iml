@@ -6,6 +6,15 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_voxel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_combat_ai/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/armor" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/figure" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/glider" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/item" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/lantern" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/npc" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/object" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/sprite" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/weapon" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
