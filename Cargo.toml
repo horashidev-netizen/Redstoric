@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/redstoric_core",
+    "crates/redstoric_voxel",
+    "crates/redstoric_combat_ai"
+]
+resolver = "2"
+
+[package]
+name = "Redstoric"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.20.1", features = ["dynamic_linking"] }
+redstoric_core = { path = "crates/redstoric_core" }
+redstoric_voxel = { path = "crates/redstoric_voxel" }
+redstoric_combat_ai = { path = "crates/redstoric_combat_ai" }
+bevy-inspector-egui = "0.38.0"
+
+dot_vox = "5.2.0"
+glam = "0.34.2"
+gltf = "1.4.1"
+walkdir = "2.5.0"
+serde_json = "1.0.154"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

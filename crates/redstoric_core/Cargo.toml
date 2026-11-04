@@ -1,0 +1,13 @@
+[package]
+name = "redstoric_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false }
+redstoric_voxel = { path = "../redstoric_voxel" }
+serde = { version = "1.0.229", features = ["derive"] }
+specs = "0.20.0"
+comp = "0.2.1"
+hashbrown = "0.17.1"
+states = "0.1.1"
