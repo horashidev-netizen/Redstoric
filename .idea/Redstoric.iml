@@ -6,6 +6,9 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_voxel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_combat_ai/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_world/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_world/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/redstoric_world/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/armor" />
       <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/figure" />
       <excludeFolder url="file://$MODULE_DIR$/assets/placeholders/glb/glider" />

@@ -59,7 +59,7 @@ pub fn character_procedural_animation(
 ) {
     let t = time.elapsed_secs();
 
-    for (character, mut root_transform) in &mut query {
+    for (character, root_transform) in &mut query {
         if let Ok(children) = model_child_query.single() {
             for child in children.iter() {
                 if let Ok(mut model_trans) = model_transforms.get_mut(child) {

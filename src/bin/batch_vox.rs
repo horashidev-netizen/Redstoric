@@ -5,12 +5,27 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-fn main() {
-    println!("=== REDSTORIC VOX TO GLB BATCH CONVERTER (CHUẨN HỆ TRỤC BEVY/glTF) ===");
+/// Vertex tối ưu 16 bytes:
+/// - pos: [f32; 3] = 12 bytes
+/// - color: [u8; 4] = 4 bytes (R, G, B, A)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlignedVoxelVertex {
+    pub pos: [f32; 3],
+    pub color: [u8; 4],
+}
 
-    // 1. Đường dẫn thư mục voxel gốc của Veloren
+pub struct ProcessedMesh {
+    pub vertices: Vec<AlignedVoxelVertex>,
+    pub indices: Vec<u32>,
+    pub min_pos: [f32; 3],
+    pub max_pos: [f32; 3],
+}
+
+fn main() {
+    println!("=== REDSTORIC VOX TO GLB CONVERTER (16-BYTE GPU ALIGNED) ===");
+
     let input_dir = PathBuf::from("/Users/tamnguyen/Downloads/veloren-master/assets/voxygen/voxel");
-    // 2. Đường dẫn xuất file glb của Redstoric
     let output_dir = PathBuf::from("/Users/tamnguyen/RustroverProjects/Redstoric/assets/placeholders/glb");
 
     if !input_dir.exists() {
@@ -18,14 +33,15 @@ fn main() {
         return;
     }
 
-    println!("Nguồn: {}", input_dir.display());
-    println!("Đích:  {}\n", output_dir.display());
-
     let mut count = 0;
     for entry in WalkDir::new(&input_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "vox") {
-            let rel_path = path.strip_prefix(&input_dir).unwrap();
+            let rel_path = match path.strip_prefix(&input_dir) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
             let mut out_path = output_dir.join(rel_path);
             out_path.set_extension("glb");
 
@@ -49,7 +65,7 @@ fn main() {
 }
 
 fn convert_single_vox(vox_path: &Path, glb_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let data: DotVoxData = dot_vox::load(vox_path.to_str().unwrap())?;
+    let data: DotVoxData = dot_vox::load(vox_path.to_str().ok_or("Đường dẫn không hợp lệ")?)?;
 
     if data.models.is_empty() {
         return Err("Model rỗng".into());
@@ -62,7 +78,7 @@ fn convert_single_vox(vox_path: &Path, glb_path: &Path) -> Result<(), Box<dyn st
         &data.palette[..]
     };
 
-    let mesh = build_mesh_aligned(model, palette);
+    let mesh = build_aligned_mesh(model, palette)?;
     if mesh.indices.is_empty() {
         return Err("Không có mặt voxel lộ ra".into());
     }
@@ -71,20 +87,7 @@ fn convert_single_vox(vox_path: &Path, glb_path: &Path) -> Result<(), Box<dyn st
     Ok(())
 }
 
-struct RawVoxelMesh {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    colors: Vec<[f32; 4]>,
-    indices: Vec<u32>,
-    min: [f32; 3],
-    max: [f32; 3],
-}
-
-/// Dựng lưới 3D với hệ trục glTF chuẩn:
-/// X_gltf = X_vox (Ngang)
-/// Y_gltf = Z_vox (Cao)
-/// Z_gltf = -Y_vox (Trước/Sau - Đảm bảo mặt trước nhìn đúng -Z của Bevy)
-fn build_mesh_aligned(model: &Model, palette: &[Color]) -> RawVoxelMesh {
+fn build_aligned_mesh(model: &Model, palette: &[Color]) -> Result<ProcessedMesh, Box<dyn std::error::Error>> {
     let sx = model.size.x as usize;
     let sy = model.size.y as usize;
     let sz = model.size.z as usize;
@@ -104,15 +107,12 @@ fn build_mesh_aligned(model: &Model, palette: &[Color]) -> RawVoxelMesh {
         }
     };
 
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut colors = Vec::new();
+    let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    let mut min = [f32::MAX; 3];
-    let mut max = [f32::MIN; 3];
+    let mut min_pos = [f32::MAX; 3];
+    let mut max_pos = [f32::MIN; 3];
 
-    // Căn tâm: X và Y đưa về giữa, Z đưa về đáy (để chân chạm đất chuẩn)
     let cx = model.size.x as f32 / 2.0;
     let cy = model.size.y as f32 / 2.0;
     let cz = model.size.z as f32 / 2.0;
@@ -123,124 +123,103 @@ fn build_mesh_aligned(model: &Model, palette: &[Color]) -> RawVoxelMesh {
         let vz = v.z as i32;
 
         let col = &palette[v.i as usize];
-        let color_rgba = [
-            (col.r as f32 / 255.0).powf(2.2), // Chuẩn sRGB sang Linear cho Bevy PBR
-            (col.g as f32 / 255.0).powf(2.2),
-            (col.b as f32 / 255.0).powf(2.2),
-            1.0,
-        ];
+        let color_rgba = [col.r, col.g, col.b, 255];
 
-        // Tọa độ góc tối thiểu của khối voxel trong glTF
-        // vx -> X
-        // vz -> Y (Chiều cao)
-        // vy -> Z (vy tiến về phía trước trong MagicaVoxel tương ứng với -Z tiến về trước trong glTF)
         let x0 = vx as f32 - cx;
         let x1 = x0 + 1.0;
 
         let y0 = vz as f32 - cz;
         let y1 = y0 + 1.0;
 
-        let z1 = -(vy as f32 - cy);       // Mặt sau
-        let z0 = z1 - 1.0;                 // Mặt trước (-Z)
+        let z1 = -(vy as f32 - cy);
+        let z0 = z1 - 1.0;
 
-        // 6 mặt với thứ tự đỉnh Counter-Clockwise (CCW) chuẩn hướng mặt ra ngoài
-        let faces: [(bool, [f32; 3], [[f32; 3]; 4]); 6] = [
-            // 1. Mặt Trên (+Y glTF = +Z vox)
+        let faces: [(bool, [[f32; 3]; 4]); 6] = [
+            // 1. Mặt Trên (+Y)
             (
                 !is_solid(vx, vy, vz + 1),
-                [0.0, 1.0, 0.0],
                 [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
             ),
-            // 2. Mặt Dưới (-Y glTF = -Z vox)
+            // 2. Mặt Dưới (-Y)
             (
                 !is_solid(vx, vy, vz - 1),
-                [0.0, -1.0, 0.0],
                 [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
             ),
-            // 3. Mặt Phải (+X glTF = +X vox)
+            // 3. Mặt Phải (+X)
             (
                 !is_solid(vx + 1, vy, vz),
-                [1.0, 0.0, 0.0],
                 [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
             ),
-            // 4. Mặt Trái (-X glTF = -X vox)
+            // 4. Mặt Trái (-X)
             (
                 !is_solid(vx - 1, vy, vz),
-                [-1.0, 0.0, 0.0],
                 [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
             ),
-            // 5. Mặt Trước (-Z glTF = +Y vox) -> Mặt sói nhìn về hướng này!
+            // 5. Mặt Trước (-Z)
             (
                 !is_solid(vx, vy + 1, vz),
-                [0.0, 0.0, -1.0],
                 [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
             ),
-            // 6. Mặt Sau (+Z glTF = -Y vox) -> Sau gáy
+            // 6. Mặt Sau (+Z)
             (
                 !is_solid(vx, vy - 1, vz),
-                [0.0, 0.0, 1.0],
                 [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
             ),
         ];
 
-        for (exposed, normal, corners) in faces {
+        for (exposed, corners) in faces {
             if exposed {
-                let base = positions.len() as u32;
-                for p in corners {
-                    positions.push(p);
-                    normals.push(normal);
-                    colors.push(color_rgba);
+                let base_idx = vertices.len() as u32;
+                for pos in corners {
+                    vertices.push(AlignedVoxelVertex {
+                        pos,
+                        color: color_rgba,
+                    });
 
-                    min[0] = min[0].min(p[0]);
-                    min[1] = min[1].min(p[1]);
-                    min[2] = min[2].min(p[2]);
+                    min_pos[0] = min_pos[0].min(pos[0]);
+                    min_pos[1] = min_pos[1].min(pos[1]);
+                    min_pos[2] = min_pos[2].min(pos[2]);
 
-                    max[0] = max[0].max(p[0]);
-                    max[1] = max[1].max(p[1]);
-                    max[2] = max[2].max(p[2]);
+                    max_pos[0] = max_pos[0].max(pos[0]);
+                    max_pos[1] = max_pos[1].max(pos[1]);
+                    max_pos[2] = max_pos[2].max(pos[2]);
                 }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                indices.extend_from_slice(&[
+                    base_idx,
+                    base_idx + 1,
+                    base_idx + 2,
+                    base_idx,
+                    base_idx + 2,
+                    base_idx + 3,
+                ]);
             }
         }
     }
 
-    RawVoxelMesh {
-        positions,
-        normals,
-        colors,
+    Ok(ProcessedMesh {
+        vertices,
         indices,
-        min,
-        max,
-    }
+        min_pos,
+        max_pos,
+    })
 }
 
-fn export_glb(mesh: &RawVoxelMesh, out_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn export_glb(mesh: &ProcessedMesh, out_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut bin_buffer = Vec::new();
 
-    let pos_offset = bin_buffer.len();
-    for p in &mesh.positions {
-        for &coord in p {
+    // Buffer 0: Các đỉnh xen kẽ (16 bytes/đỉnh)
+    // 0..12 bytes: POSITION (3x f32)
+    // 12..16 bytes: COLOR_0 (4x u8)
+    let v_offset = bin_buffer.len();
+    for v in &mesh.vertices {
+        for coord in v.pos {
             bin_buffer.extend_from_slice(&coord.to_le_bytes());
         }
+        bin_buffer.extend_from_slice(&v.color);
     }
-    let pos_len = bin_buffer.len() - pos_offset;
+    let v_len = bin_buffer.len() - v_offset;
 
-    let norm_offset = bin_buffer.len();
-    for n in &mesh.normals {
-        for &coord in n {
-            bin_buffer.extend_from_slice(&coord.to_le_bytes());
-        }
-    }
-    let norm_len = bin_buffer.len() - norm_offset;
-
-    let col_offset = bin_buffer.len();
-    for c in &mesh.colors {
-        for &channel in c {
-            bin_buffer.extend_from_slice(&channel.to_le_bytes());
-        }
-    }
-    let col_len = bin_buffer.len() - col_offset;
-
+    // Buffer 1: Indices
     let idx_offset = bin_buffer.len();
     for &i in &mesh.indices {
         bin_buffer.extend_from_slice(&i.to_le_bytes());
@@ -257,7 +236,7 @@ fn export_glb(mesh: &RawVoxelMesh, out_path: &Path) -> Result<(), Box<dyn std::e
         "scenes": [{ "nodes": [0] }],
         "nodes": [{ "mesh": 0, "name": "VoxelModel" }],
         "materials": [{
-            "name": "VoxelPbrMaterial",
+            "name": "VoxelMaterial",
             "pbrMetallicRoughness": {
                 "roughnessFactor": 0.85,
                 "metallicFactor": 0.05
@@ -268,10 +247,9 @@ fn export_glb(mesh: &RawVoxelMesh, out_path: &Path) -> Result<(), Box<dyn std::e
             "primitives": [{
                 "attributes": {
                     "POSITION": 0,
-                    "NORMAL": 1,
-                    "COLOR_0": 2
+                    "COLOR_0": 1
                 },
-                "indices": 3,
+                "indices": 2,
                 "material": 0,
                 "mode": 4
             }]
@@ -279,36 +257,43 @@ fn export_glb(mesh: &RawVoxelMesh, out_path: &Path) -> Result<(), Box<dyn std::e
         "accessors": [
             {
                 "bufferView": 0,
-                "componentType": 5126,
-                "count": mesh.positions.len(),
+                "byteOffset": 0,
+                "componentType": 5126, // FLOAT (Chuẩn bắt buộc của Bevy POSITION)
+                "count": mesh.vertices.len(),
                 "type": "VEC3",
-                "min": mesh.min,
-                "max": mesh.max
+                "min": mesh.min_pos,
+                "max": mesh.max_pos
+            },
+            {
+                "bufferView": 0,
+                "byteOffset": 12,
+                "componentType": 5121, // UNSIGNED_BYTE (Nén màu RGBA)
+                "count": mesh.vertices.len(),
+                "type": "VEC4",
+                "normalized": true
             },
             {
                 "bufferView": 1,
-                "componentType": 5126,
-                "count": mesh.normals.len(),
-                "type": "VEC3"
-            },
-            {
-                "bufferView": 2,
-                "componentType": 5126,
-                "count": mesh.colors.len(),
-                "type": "VEC4"
-            },
-            {
-                "bufferView": 3,
-                "componentType": 5125,
+                "byteOffset": 0,
+                "componentType": 5125, // UNSIGNED_INT
                 "count": mesh.indices.len(),
                 "type": "SCALAR"
             }
         ],
         "bufferViews": [
-            { "buffer": 0, "byteOffset": pos_offset, "byteLength": pos_len, "target": 34962 },
-            { "buffer": 0, "byteOffset": norm_offset, "byteLength": norm_len, "target": 34962 },
-            { "buffer": 0, "byteOffset": col_offset, "byteLength": col_len, "target": 34962 },
-            { "buffer": 0, "byteOffset": idx_offset, "byteLength": idx_len, "target": 34963 }
+            {
+                "buffer": 0,
+                "byteOffset": v_offset,
+                "byteLength": v_len,
+                "byteStride": 16,
+                "target": 34962
+            },
+            {
+                "buffer": 0,
+                "byteOffset": idx_offset,
+                "byteLength": idx_len,
+                "target": 34963
+            }
         ],
         "buffers": [{ "byteLength": bin_buffer.len() }]
     });

@@ -1,7 +1,7 @@
 use crate::block::BlockType;
 
 pub const CHUNK_SIZE_X: usize = 16;
-pub const CHUNK_SIZE_Y: usize = 32;
+pub const CHUNK_SIZE_Y: usize = 64;
 pub const CHUNK_SIZE_Z: usize = 16;
 
 #[derive(Clone)]

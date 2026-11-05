@@ -1,5 +1,7 @@
 pub mod character_visual;
 pub mod biped;
+pub mod fps_counter;
+pub mod voxel_material;
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;

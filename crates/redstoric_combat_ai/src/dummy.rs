@@ -43,13 +43,12 @@ pub fn dummy_ground_system(
 
     for mut transform in &mut query {
         let ground_y = map.get_highest_block(transform.translation.x, transform.translation.z);
+        // Khi map đã load được chunk ở tọa độ đó (> 0.0)
         if ground_y > 0.0 {
-            // Đặt chân bù nhìn đứng đúng trên mặt cỏ (+1.0 là nửa chiều cao)
-            transform.translation.y = ground_y + 1.0;
+            transform.translation.y = ground_y + 1.0; // Ghim thẳng xuống mặt cỏ
         }
     }
 }
-
 /// Xử lý văng lùi (Knockback) khi dính chém
 pub fn dummy_knockback_system(
     time: Res<Time>,

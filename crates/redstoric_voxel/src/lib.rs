@@ -4,6 +4,9 @@ pub mod generation;
 pub mod map;
 pub mod meshing;
 pub mod systems;
+pub mod worldgen;
+pub mod prop;
+pub use prop::{WorldProp, WorldPropKind, PropSpawnData};
 
 pub use block::BlockType;
 pub use chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};

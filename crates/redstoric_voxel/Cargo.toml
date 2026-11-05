@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.20.1", default-features = false }
+bevy = { version = "0.20.1", features = ["bevy_mesh", "scene"] }
 noise = "0.9"

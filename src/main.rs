@@ -1,33 +1,29 @@
 use bevy::light::GlobalAmbientLight;
 use bevy::prelude::*;
-use bevy_inspector_egui::quick::WorldInspectorPlugin; // <-- Cửa sổ kéo thả trực quan
 use redstoric_combat_ai::{CombatAiPlugin, MeleeAttacker};
-use redstoric_core::{
-    biped::*, Character, CorePlugin, OrbitCamera, WeaponHand,
-};
+use redstoric_core::{biped::*, Character, CorePlugin, OrbitCamera, WeaponHand};
 use redstoric_voxel::{VoxelViewer, VoxelWorldPlugin};
-use std::f32::consts::FRAC_PI_2;
-use bevy_inspector_egui::bevy_egui::EguiPlugin;
+use bevy::window::PresentMode;
+use redstoric_core::fps_counter::FpsOverlayPlugin;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Redstoric Engine - Inspector Rig Tool".into(),
+                title: "Redstoric".into(),
+                present_mode: PresentMode::Fifo,
                 ..default()
             }),
             ..default()
         }))
+        .add_plugins(FpsOverlayPlugin)
+        .add_plugins((CorePlugin, CombatAiPlugin, VoxelWorldPlugin))
         .insert_resource(GlobalAmbientLight {
-            color: Color::WHITE,
-            brightness: 700.0,
+            color: Color::srgb(0.9, 0.95, 1.0),
+            brightness: 180.0,
             ..default()
         })
-        .add_plugins((CorePlugin, CombatAiPlugin, VoxelWorldPlugin))
-        // 1. Phải thêm EguiPlugin trước:
-        .add_plugins(EguiPlugin::default())
-        // 2. Rồi mới đến WorldInspectorPlugin:
-        .add_plugins(WorldInspectorPlugin::new())
+        .insert_resource(ClearColor(Color::srgb(0.68, 0.78, 0.90)))
         .add_systems(Startup, (setup_environment, spawn_player))
         .add_systems(Update, fix_voxel_character_materials)
         .run();
@@ -37,19 +33,28 @@ fn setup_environment(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: true,
-            illuminance: 16_000.0,
-            shadow_depth_bias: 0.08,
-            shadow_normal_bias: 1.5,
+            illuminance: 10_000.0,
+            shadow_depth_bias: 0.02,   // Giảm bias để tránh đứt bóng ở mép khối
+            shadow_normal_bias: 0.6,
             ..default()
         },
-        Transform::from_xyz(40.0, 60.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(30.0, 50.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 25.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         OrbitCamera {
-            distance: 6.0,
+            distance: 9.0,
+            ..default()
+        },
+        // Tăng tầm nhìn sương mù cho địa hình mới
+        DistanceFog {
+            color: Color::srgba(0.68, 0.78, 0.90, 1.0),
+            falloff: FogFalloff::Linear {
+                start: 60.0,
+                end: 130.0,
+            },
             ..default()
         },
     ));
@@ -57,7 +62,7 @@ fn setup_environment(mut commands: Commands) {
 
 fn fix_voxel_character_materials(
     mut materials: ResMut<Assets<StandardMaterial>>,
-    query: Query<&MeshMaterial3d<StandardMaterial>, Added<MeshMaterial3d<StandardMaterial>>>,
+    query: Query<&MeshMaterial3d<StandardMaterial>, (Added<MeshMaterial3d<StandardMaterial>>, Without<redstoric_voxel::systems::ChunkComponent>)>,
 ) {
     for handle in &query {
         if let Some(mut mat) = materials.get_mut(&handle.0) {
@@ -227,3 +232,4 @@ fn spawn_player(mut commands: Commands, asset_server: Res<AssetServer>) {
                 });
         });
 }
+
