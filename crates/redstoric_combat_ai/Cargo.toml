@@ -1,0 +1,9 @@
+[package]
+name = "redstoric_combat_ai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { workspace = true }
+redstoric_core = { path = "../redstoric_core" }
+redstoric_voxel = { path = "../redstoric_voxel" }

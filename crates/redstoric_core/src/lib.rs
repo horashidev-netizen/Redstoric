@@ -1,0 +1,230 @@
+pub mod character_creator;
+pub mod character_visual;
+pub mod biped;
+pub mod fps_counter;
+pub mod graphics;
+pub mod graphics_menu;
+pub mod minimap;
+pub mod voxel_material;
+
+use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::prelude::*;
+use redstoric_voxel::VoxelWorldMap;
+pub use character_visual::{CharacterModelRoot, clean_character_glb_hierarchy, character_procedural_animation};
+use crate::biped::biped_walk_animation_system;
+
+pub struct CorePlugin;
+impl Plugin for CorePlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (
+                character_controller,
+                orbit_camera_system,
+                clean_character_glb_hierarchy,
+                character_procedural_animation,
+                biped_walk_animation_system
+            ),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionState {
+    #[default]
+    Idle,
+    Running,
+    Attacking(u8),
+}
+
+#[derive(Component)]
+pub struct Character {
+    pub speed: f32,
+    pub velocity_y: f32,
+    pub is_grounded: bool,
+    pub state: ActionState,
+    pub attack_timer: f32,
+}
+
+impl Default for Character {
+    fn default() -> Self {
+        Self {
+            speed: 10.0,
+            velocity_y: 0.0,
+            is_grounded: false,
+            state: ActionState::Idle,
+            attack_timer: 0.0,
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct WeaponHand;
+
+/// Component gắn vào Camera để xoay quanh nhân vật (Orbit Camera)
+#[derive(Component)]
+pub struct OrbitCamera {
+    pub target: Option<Entity>,
+    pub distance: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub yaw: f32,   // Xoay ngang quanh trục Y
+    pub pitch: f32, // Xoay dọc lên/xuống
+    pub sensitivity: f32,
+    pub zoom_speed: f32,
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            target: None,
+            distance: 12.0,
+            min_distance: 3.0,
+            max_distance: 30.0,
+            yaw: 0.0,
+            pitch: -0.35, // Hơi chúc xuống 20 độ
+            sensitivity: 0.005,
+            zoom_speed: 1.5,
+        }
+    }
+}
+
+const GRAVITY: f32 = -26.0;
+const JUMP_FORCE: f32 = 11.0;
+
+pub fn character_controller(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    voxel_map: Option<Res<VoxelWorldMap>>,
+    camera_query: Query<&Transform, (With<OrbitCamera>, Without<Character>)>,
+    mut query: Query<(&mut Character, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    let Ok(camera_transform) = camera_query.single() else { return; };
+
+    // Lấy vector chỉ hướng nhìn của Camera trên mặt phẳng nằm ngang (XZ)
+    let cam_forward = camera_transform.forward();
+    let forward_flat = Vec3::new(cam_forward.x, 0.0, cam_forward.z).normalize_or_zero();
+
+    let cam_right = camera_transform.right();
+    let right_flat = Vec3::new(cam_right.x, 0.0, cam_right.z).normalize_or_zero();
+
+    for (mut character, mut transform) in &mut query {
+        let mut move_input = Vec3::ZERO;
+        if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
+            move_input += forward_flat;
+        }
+        if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
+            move_input -= forward_flat;
+        }
+        if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
+            move_input -= right_flat;
+        }
+        if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
+            move_input += right_flat;
+        }
+
+        // 1. Lấy độ cao mặt đất thực tế
+        let ground_y = if let Some(ref map) = voxel_map {
+            map.get_walk_height(transform.translation.x, transform.translation.z, transform.translation.y).0
+        } else {
+            0.0
+        };
+
+        // 2. Nhảy
+        if keyboard.just_pressed(KeyCode::Space) && character.is_grounded {
+            character.velocity_y = JUMP_FORCE;
+            character.is_grounded = false;
+        }
+
+        // 3. Trọng lực & Rơi tự do
+        character.velocity_y += GRAVITY * dt;
+        transform.translation.y += character.velocity_y * dt;
+
+        // 4. Va chạm với mặt đất voxel
+        if transform.translation.y <= ground_y {
+            transform.translation.y = ground_y;
+            character.velocity_y = 0.0;
+            character.is_grounded = true;
+        } else if transform.translation.y - ground_y > 0.2 {
+            character.is_grounded = false;
+        }
+
+        // 5. Di chuyển nhân vật theo hướng camera và Auto Step-up
+        if move_input != Vec3::ZERO {
+            let direction = move_input.normalize();
+            let next_x = transform.translation.x + direction.x * character.speed * dt;
+            let next_z = transform.translation.z + direction.z * character.speed * dt;
+
+            if let Some(ref map) = voxel_map {
+                let (next_ground, blocked) =
+                    map.get_walk_height(next_x, next_z, transform.translation.y);
+                if !blocked && next_ground - transform.translation.y <= 1.25 {
+                    transform.translation.x = next_x;
+                    transform.translation.z = next_z;
+                    if next_ground > transform.translation.y {
+                        transform.translation.y = next_ground;
+                    }
+                }
+            } else {
+                transform.translation.x = next_x;
+                transform.translation.z = next_z;
+            }
+
+            let target_rotation = Quat::from_rotation_y((-direction.x).atan2(-direction.z));
+            transform.rotation = transform.rotation.slerp(target_rotation, (15.0 * dt).min(1.0));
+
+            if character.attack_timer <= 0.0 {
+                character.state = ActionState::Running;
+            }
+        } else if character.attack_timer <= 0.0 {
+            character.state = ActionState::Idle;
+        }
+    }
+}
+
+/// Hệ thống xoay và zoom Orbit Camera
+pub fn orbit_camera_system(
+    _time: Res<Time>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion_events: MessageReader<MouseMotion>,
+    mut scroll_events: MessageReader<MouseWheel>,
+    target_query: Query<&Transform, (With<Character>, Without<OrbitCamera>)>,
+    mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<Character>>,
+) {
+    let Ok((mut orbit, mut cam_transform)) = camera_query.single_mut() else { return; };
+    let Ok(player_transform) = target_query.single() else { return; };
+
+    // 1. Giữ chuột phải để xoay Camera 360 độ
+    if mouse_button.pressed(MouseButton::Right) {
+        for ev in mouse_motion_events.read() {
+            // Sử dụng delta_seconds để tốc độ xoay mượt mà, không phụ thuộc vào FPS
+            orbit.yaw -= ev.delta.x * orbit.sensitivity;
+            orbit.pitch -= ev.delta.y * orbit.sensitivity;
+
+            // Giới hạn góc nhìn dọc (pitch) để tránh lật ngược camera
+            orbit.pitch = orbit.pitch.clamp(-1.3, 0.4);
+        }
+    }
+    // LƯU Ý: Đã xóa phần `else { mouse_motion_events.clear(); }`
+    // Vì EventReader trong Bevy tự động dọn sạch (clear) các sự kiện cũ ở mỗi đầu frame!
+
+    // 2. Lăn chuột để Zoom xa / gần
+    for ev in scroll_events.read() {
+        orbit.distance -= ev.y * orbit.zoom_speed;
+        orbit.distance = orbit.distance.clamp(orbit.min_distance, orbit.max_distance);
+    }
+
+    // 3. Tính toán vị trí Camera dựa trên Yaw, Pitch và Distance
+    let target_pos = player_transform.translation + Vec3::Y * 1.5; // Điểm nhìn (Ngực nhân vật)
+
+    // Đổi thứ tự xoay thành YXZ giúp tránh hiện tượng Gimbal Lock
+    let rotation = Quat::from_rotation_y(orbit.yaw) * Quat::from_rotation_x(orbit.pitch);
+
+    // Tính toán khoảng cách offset (camera luôn nằm phía sau hướng nhìn)
+    let camera_offset = rotation * Vec3::new(0.0, 0.0, orbit.distance);
+
+    // Cập nhật vị trí và hướng nhìn của camera
+    cam_transform.translation = target_pos + camera_offset;
+    cam_transform.look_at(target_pos, Vec3::Y);
+}

@@ -1,0 +1,709 @@
+//! Tạo & tuỳ chỉnh nhân vật từ các mảnh model trong `assets/placeholders/glb/figure`.
+//!
+//! * Chủng tộc: human, elf, dwarf, orc, danari, draugr. Giới tính: nam / nữ.
+//! * Các mảnh tuỳ chọn: tóc, râu, mắt, phụ kiện (sừng, khuyên tai, băng trán...).
+//! * Danh sách mảnh được quét tự động từ thư mục asset khi khởi động, nên thêm file `.glb`
+//!   mới là menu tự có thêm lựa chọn.
+//! * Mở / đóng menu bằng **F7**. Lựa chọn được lưu vào `character_appearance.json`.
+//!
+//! Nhân vật được dựng thành một bộ khung người (ngực, đầu, tay, chân) dùng lại các component
+//! `Bone*` của `biped.rs`, nên hoạt ảnh chạy / đánh hiện có vẫn hoạt động.
+#![allow(deprecated)]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use bevy::prelude::*;
+use bevy::ui::FocusPolicy;
+use serde::{Deserialize, Serialize};
+
+use crate::biped::*;
+use crate::{Character, WeaponHand};
+
+const APPEARANCE_PATH: &str = "character_appearance.json";
+const FIGURE_DIR: &str = "placeholders/glb/figure";
+
+/// Tỉ lệ voxel -> đơn vị thế giới. Nhân vật cao khoảng 19 voxel => ~1.6 đơn vị.
+const MODEL_SCALE: f32 = 0.085;
+
+// ---------------------------------------------------------------------------------------------
+// Dữ liệu
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum Species {
+    Human,
+    Elf,
+    Dwarf,
+    Orc,
+    Danari,
+    Draugr,
+}
+
+impl Species {
+    pub const ALL: [Species; 6] = [
+        Species::Human,
+        Species::Elf,
+        Species::Dwarf,
+        Species::Orc,
+        Species::Danari,
+        Species::Draugr,
+    ];
+
+    fn dir(self) -> &'static str {
+        match self {
+            Species::Human => "human",
+            Species::Elf => "elf",
+            Species::Dwarf => "dwarf",
+            Species::Orc => "orc",
+            Species::Danari => "danari",
+            Species::Draugr => "draugr",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Species::Human => "Human",
+            Species::Elf => "Elf",
+            Species::Dwarf => "Dwarf",
+            Species::Orc => "Orc",
+            Species::Danari => "Danari",
+            Species::Draugr => "Draugr",
+        }
+    }
+}
+
+/// Lựa chọn ngoại hình hiện tại. Với tóc / râu / phụ kiện: `0` = không có, `k` = mảnh thứ `k-1`.
+/// Với mắt: chỉ số trực tiếp trong danh sách.
+#[derive(Resource, Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CharacterAppearance {
+    pub species: Species,
+    pub female: bool,
+    pub hair: usize,
+    pub beard: usize,
+    pub eyes: usize,
+    pub accessory: usize,
+}
+
+impl Default for CharacterAppearance {
+    fn default() -> Self {
+        Self {
+            species: Species::Human,
+            female: false,
+            hair: 1,
+            beard: 0,
+            eyes: 0,
+            accessory: 0,
+        }
+    }
+}
+
+fn load_appearance() -> CharacterAppearance {
+    std::fs::read_to_string(APPEARANCE_PATH)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_appearance(appearance: &CharacterAppearance) {
+    if let Ok(json) = serde_json::to_string_pretty(appearance) {
+        let _ = std::fs::write(APPEARANCE_PATH, json);
+    }
+}
+
+#[derive(Default, Clone)]
+struct PartLists {
+    hair: Vec<String>,
+    beard: Vec<String>,
+    eyes: Vec<String>,
+    accessory: Vec<String>,
+}
+
+/// Danh sách mảnh có sẵn (đường dẫn tương đối trong thư mục `figure`) theo (chủng tộc, giới tính).
+#[derive(Resource, Default)]
+pub struct AppearanceCatalog {
+    lists: HashMap<(Species, bool), PartLists>,
+}
+
+impl AppearanceCatalog {
+    fn get(&self, species: Species, female: bool) -> PartLists {
+        self.lists.get(&(species, female)).cloned().unwrap_or_default()
+    }
+}
+
+fn natural_key(name: &str) -> (String, u32) {
+    let stem = name.trim_end_matches(".glb");
+    let digits: String = stem
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let number = digits.parse().unwrap_or(0);
+    (stem[..stem.len() - digits.len()].to_string(), number)
+}
+
+fn list_glb(base: &Path, sub: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(base.join(sub))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".glb"))
+        .collect();
+    names.sort_by_key(|name| natural_key(name));
+    names
+}
+
+fn find_figure_dir() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("assets").join(FIGURE_DIR),
+        PathBuf::from("../../assets").join(FIGURE_DIR),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets").join(FIGURE_DIR),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+fn scan_catalog() -> AppearanceCatalog {
+    let mut catalog = AppearanceCatalog::default();
+    let Some(base) = find_figure_dir() else {
+        warn!("Không tìm thấy thư mục {FIGURE_DIR}; menu tạo nhân vật sẽ trống");
+        return catalog;
+    };
+
+    for species in Species::ALL {
+        let dir = species.dir();
+        for female in [false, true] {
+            let sex = if female { "female" } else { "male" };
+            let mut lists = PartLists::default();
+
+            // Tóc: hair/<species>/<sex>-N.glb
+            for name in list_glb(&base, &format!("hair/{dir}")) {
+                if name.starts_with(&format!("{sex}-")) {
+                    lists.hair.push(format!("hair/{dir}/{name}"));
+                }
+            }
+            // Râu: chỉ nam
+            if !female {
+                for name in list_glb(&base, &format!("beard/{dir}")) {
+                    lists.beard.push(format!("beard/{dir}/{name}"));
+                }
+            }
+            // Mắt: riêng của chủng tộc, sau đó là bộ mắt chung
+            for name in list_glb(&base, &format!("eyes/{dir}")) {
+                if name.starts_with(&format!("{sex}-")) || name.starts_with(&format!("{sex}_")) {
+                    lists.eyes.push(format!("eyes/{dir}/{name}"));
+                }
+            }
+            for name in list_glb(&base, "eyes/general") {
+                if name.starts_with(&format!("{sex}_")) {
+                    lists.eyes.push(format!("eyes/general/{name}"));
+                }
+            }
+            // Phụ kiện: lọc theo dấu hiệu giới tính trong tên file (không có dấu hiệu => dùng chung)
+            for name in list_glb(&base, &format!("accessory/{dir}")) {
+                let is_female = name.contains("female");
+                let is_male = name.contains("male") && !is_female;
+                if (female && is_male) || (!female && is_female) {
+                    continue;
+                }
+                lists.accessory.push(format!("accessory/{dir}/{name}"));
+            }
+
+            catalog.lists.insert((species, female), lists);
+        }
+    }
+    catalog
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dựng nhân vật
+// ---------------------------------------------------------------------------------------------
+
+/// Đánh dấu entity gốc của bộ model nhân vật (bị xoá và dựng lại mỗi khi đổi ngoại hình).
+#[derive(Component)]
+struct HumanoidRoot;
+
+/// Bố cục bộ khung (đơn vị voxel, gốc ở lòng bàn chân, mặt hướng -Z). Chỉnh ở đây nếu các mảnh
+/// bị lệch nhau.
+mod layout {
+    pub const HIP_Y: f32 = 4.0; // khớp chân
+    pub const FOOT_X: f32 = 2.5;
+    pub const FOOT_OFFSET: (f32, f32, f32) = (0.0, -2.5, -1.0);
+    pub const PANTS_Y: f32 = 4.5;
+    pub const BELT_Y: f32 = 6.0;
+    pub const CHEST_Y: f32 = 8.5;
+    pub const HEAD_Y: f32 = 6.5; // so với ngực
+    pub const SHOULDER: (f32, f32) = (8.0, 2.0); // (x, y) so với ngực
+    pub const HAND_Y: f32 = -3.0; // so với vai
+    pub const EYES: (f32, f32, f32) = (0.0, 0.5, -4.0); // so với đầu
+    pub const BEARD: (f32, f32, f32) = (0.0, -3.0, -2.5);
+    pub const ACCESSORY: (f32, f32, f32) = (0.0, 0.0, 0.0);
+    pub const WEAPON: (f32, f32, f32) = (0.5, 0.5, -2.5);
+}
+
+fn rebuild_humanoid(
+    mut commands: Commands,
+    appearance: Res<CharacterAppearance>,
+    catalog: Res<AppearanceCatalog>,
+    asset_server: Res<AssetServer>,
+    player: Query<Entity, With<Character>>,
+    old: Query<Entity, With<HumanoidRoot>>,
+) {
+    if !appearance.is_changed() {
+        return;
+    }
+    let Ok(player) = player.single() else {
+        return;
+    };
+    for entity in &old {
+        commands.entity(entity).despawn();
+    }
+
+    let sex = if appearance.female { "female" } else { "male" };
+    let lists = catalog.get(appearance.species, appearance.female);
+    let load = |rel: String| {
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset(format!("placeholders/glb/{rel}")))
+    };
+
+    let pants = load(format!("figure/body/pants_{sex}.glb"));
+    let belt = load(format!("figure/body/belt_{sex}.glb"));
+    let chest = load(format!("figure/body/chest_{sex}.glb"));
+    let foot = load("figure/body/foot.glb".to_string());
+    let hand = load("figure/body/hand.glb".to_string());
+    let head = load(format!("figure/head/{}/{sex}.glb", appearance.species.dir()));
+    let hair = appearance.hair.checked_sub(1).and_then(|i| lists.hair.get(i)).map(|p| load(format!("figure/{p}")));
+    let beard = appearance.beard.checked_sub(1).and_then(|i| lists.beard.get(i)).map(|p| load(format!("figure/{p}")));
+    let eyes = lists.eyes.get(appearance.eyes).map(|p| load(format!("figure/{p}")));
+    let accessory = appearance
+        .accessory
+        .checked_sub(1)
+        .and_then(|i| lists.accessory.get(i))
+        .map(|p| load(format!("figure/{p}")));
+    let weapon = load("weapon/sword/caladbolg.glb".to_string());
+
+    commands.entity(player).with_children(|root| {
+        root.spawn((
+            Transform::from_scale(Vec3::splat(MODEL_SCALE)),
+            Visibility::default(),
+            HumanoidRoot,
+        ))
+        .with_children(|body| {
+            // Hông + thắt lưng (đứng yên theo thân)
+            body.spawn((WorldAssetRoot(pants), Transform::from_xyz(0.0, layout::PANTS_Y, 0.0)));
+            body.spawn((WorldAssetRoot(belt), Transform::from_xyz(0.0, layout::BELT_Y, 0.0)));
+
+            // Chân (bàn chân là phần chân của model "chibi"), xoay quanh khớp hông
+            let (fx, fy, fz) = layout::FOOT_OFFSET;
+            body.spawn((
+                Transform::from_xyz(-layout::FOOT_X, layout::HIP_Y, 0.0),
+                Visibility::default(),
+                BoneLegLeft,
+            ))
+            .with_children(|leg| {
+                leg.spawn((WorldAssetRoot(foot.clone()), Transform::from_xyz(fx, fy, fz)));
+            });
+            body.spawn((
+                Transform::from_xyz(layout::FOOT_X, layout::HIP_Y, 0.0),
+                Visibility::default(),
+                BoneLegRight,
+            ))
+            .with_children(|leg| {
+                leg.spawn((WorldAssetRoot(foot), Transform::from_xyz(fx, fy, fz)));
+            });
+
+            // Ngực + đầu + tay
+            body.spawn((
+                Transform::from_xyz(0.0, layout::CHEST_Y, 0.0),
+                Visibility::default(),
+                BoneChest,
+            ))
+            .with_children(|c| {
+                c.spawn((WorldAssetRoot(chest), Transform::IDENTITY));
+
+                // Đầu và các mảnh gắn trên đầu
+                c.spawn((
+                    Transform::from_xyz(0.0, layout::HEAD_Y, 0.0),
+                    Visibility::default(),
+                    BoneHead,
+                ))
+                .with_children(|h| {
+                    h.spawn((WorldAssetRoot(head), Transform::IDENTITY));
+                    if let Some(scene) = hair {
+                        h.spawn((WorldAssetRoot(scene), Transform::IDENTITY));
+                    }
+                    if let Some(scene) = eyes {
+                        let (x, y, z) = layout::EYES;
+                        h.spawn((WorldAssetRoot(scene), Transform::from_xyz(x, y, z)));
+                    }
+                    if let Some(scene) = beard {
+                        let (x, y, z) = layout::BEARD;
+                        h.spawn((WorldAssetRoot(scene), Transform::from_xyz(x, y, z)));
+                    }
+                    if let Some(scene) = accessory {
+                        let (x, y, z) = layout::ACCESSORY;
+                        h.spawn((WorldAssetRoot(scene), Transform::from_xyz(x, y, z)));
+                    }
+                });
+
+                // Tay trái
+                c.spawn((
+                    Transform::from_xyz(-layout::SHOULDER.0, layout::SHOULDER.1, 0.0),
+                    Visibility::default(),
+                    BoneShoulderLeft,
+                ))
+                .with_children(|sh| {
+                    sh.spawn((
+                        WorldAssetRoot(hand.clone()),
+                        Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
+                        BoneHandLeft,
+                    ));
+                });
+
+                // Tay phải cầm kiếm
+                c.spawn((
+                    Transform::from_xyz(layout::SHOULDER.0, layout::SHOULDER.1, 0.0),
+                    Visibility::default(),
+                    BoneShoulderRight,
+                ))
+                .with_children(|sh| {
+                    sh.spawn((
+                        Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
+                        Visibility::default(),
+                        BoneHandRight,
+                    ))
+                    .with_children(|hand_node| {
+                        hand_node.spawn((WorldAssetRoot(hand), Transform::IDENTITY));
+                        let (x, y, z) = layout::WEAPON;
+                        hand_node.spawn((
+                            WorldAssetRoot(weapon),
+                            Transform::from_xyz(x, y, z),
+                            WeaponHand,
+                        ));
+                    });
+                });
+            });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Menu
+// ---------------------------------------------------------------------------------------------
+
+const BTN_NORMAL: Color = Color::srgb(0.20, 0.22, 0.28);
+const BTN_HOVER: Color = Color::srgb(0.30, 0.34, 0.44);
+const BTN_PRESSED: Color = Color::srgb(0.12, 0.14, 0.20);
+
+/// Trạng thái menu. Hệ thống chiến đấu đọc `open` để bỏ qua click khi đang bấm trong menu.
+#[derive(Resource, Default)]
+pub struct CreatorMenu {
+    pub open: bool,
+}
+
+#[derive(Component)]
+struct CreatorRoot;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Species,
+    Sex,
+    Hair,
+    Beard,
+    Eyes,
+    Accessory,
+}
+
+#[derive(Component, Clone, Copy, PartialEq)]
+enum CreatorAction {
+    Step(Field, i32),
+    Randomize,
+    Close,
+}
+
+#[derive(Component)]
+struct FieldText(Field);
+
+pub struct CharacterCreatorPlugin;
+
+impl Plugin for CharacterCreatorPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(load_appearance())
+            .insert_resource(scan_catalog())
+            .init_resource::<CreatorMenu>()
+            .add_systems(Startup, spawn_creator_menu)
+            .add_systems(
+                Update,
+                (toggle_creator, handle_creator_buttons, refresh_creator, rebuild_humanoid).chain(),
+            );
+    }
+}
+
+fn menu_text(text: &str, size: f32, color: Color) -> (Text, TextFont, TextColor) {
+    (
+        Text::new(text),
+        TextFont {
+            font_size: FontSize::Px(size),
+            ..default()
+        },
+        TextColor(color),
+    )
+}
+
+macro_rules! creator_button {
+    ($parent:expr, $label:expr, $action:expr) => {
+        $parent
+            .spawn((
+                Interaction::None,
+                FocusPolicy::Block,
+                Node {
+                    padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(BTN_NORMAL),
+                $action,
+            ))
+            .with_children(|button| {
+                button.spawn(menu_text($label, 16.0, Color::WHITE));
+            });
+    };
+}
+
+fn spawn_creator_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::FlexStart,
+                align_items: AlignItems::Center,
+                padding: UiRect::left(Val::Px(24.0)),
+                ..default()
+            },
+            Visibility::Hidden,
+            CreatorRoot,
+        ))
+        .with_children(|overlay| {
+            overlay
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(10.0),
+                        padding: UiRect::all(Val::Px(18.0)),
+                        min_width: Val::Px(340.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.05, 0.06, 0.09, 0.94)),
+                ))
+                .with_children(|panel| {
+                    panel.spawn(menu_text("Character  [F7]", 22.0, Color::WHITE));
+
+                    for (name, field) in [
+                        ("Species", Field::Species),
+                        ("Sex", Field::Sex),
+                        ("Hair", Field::Hair),
+                        ("Beard", Field::Beard),
+                        ("Eyes", Field::Eyes),
+                        ("Accessory", Field::Accessory),
+                    ] {
+                        panel
+                            .spawn(Node {
+                                column_gap: Val::Px(10.0),
+                                align_items: AlignItems::Center,
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                creator_button!(row, "<", CreatorAction::Step(field, -1));
+                                row.spawn((
+                                    Node {
+                                        min_width: Val::Px(210.0),
+                                        justify_content: JustifyContent::Center,
+                                        ..default()
+                                    },
+                                    Visibility::default(),
+                                ))
+                                .with_children(|label| {
+                                    label
+                                        .spawn(menu_text(&format!("{name}: "), 16.0, Color::WHITE))
+                                        .with_children(|text| {
+                                            text.spawn((
+                                                TextSpan::new("..."),
+                                                TextFont {
+                                                    font_size: FontSize::Px(16.0),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.6, 0.9, 1.0)),
+                                                FieldText(field),
+                                            ));
+                                        });
+                                });
+                                creator_button!(row, ">", CreatorAction::Step(field, 1));
+                            });
+                    }
+
+                    panel
+                        .spawn(Node {
+                            column_gap: Val::Px(10.0),
+                            margin: UiRect::top(Val::Px(6.0)),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            creator_button!(row, "Randomize", CreatorAction::Randomize);
+                            creator_button!(row, "Close (F7)", CreatorAction::Close);
+                        });
+                });
+        });
+}
+
+fn toggle_creator(keys: Res<ButtonInput<KeyCode>>, mut menu: ResMut<CreatorMenu>) {
+    if keys.just_pressed(KeyCode::F7) {
+        menu.open = !menu.open;
+    }
+}
+
+/// Đặt lại các mảnh tuỳ chọn khi đổi chủng tộc / giới tính (danh sách mảnh khác nhau).
+fn reset_parts(app: &mut CharacterAppearance, catalog: &AppearanceCatalog) {
+    let lists = catalog.get(app.species, app.female);
+    app.hair = if lists.hair.is_empty() { 0 } else { 1 };
+    app.beard = 0;
+    app.eyes = 0;
+    app.accessory = 0;
+}
+
+fn step_field(app: &mut CharacterAppearance, catalog: &AppearanceCatalog, field: Field, delta: i32) {
+    let lists = catalog.get(app.species, app.female);
+    let wrap = |cur: usize, n: usize| -> usize {
+        if n == 0 {
+            0
+        } else {
+            (cur as i32 + delta).rem_euclid(n as i32) as usize
+        }
+    };
+    match field {
+        Field::Species => {
+            let i = Species::ALL.iter().position(|s| *s == app.species).unwrap_or(0);
+            let next = (i as i32 + delta).rem_euclid(Species::ALL.len() as i32) as usize;
+            app.species = Species::ALL[next];
+            reset_parts(app, catalog);
+        }
+        Field::Sex => {
+            app.female = !app.female;
+            reset_parts(app, catalog);
+        }
+        Field::Hair => app.hair = wrap(app.hair, lists.hair.len() + 1),
+        Field::Beard => app.beard = wrap(app.beard, lists.beard.len() + 1),
+        Field::Eyes => app.eyes = wrap(app.eyes, lists.eyes.len()),
+        Field::Accessory => app.accessory = wrap(app.accessory, lists.accessory.len() + 1),
+    }
+}
+
+fn randomize(app: &mut CharacterAppearance, catalog: &AppearanceCatalog) {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(12345)
+        | 1;
+    let mut next = |n: usize| -> usize {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        if n == 0 { 0 } else { seed as usize % n }
+    };
+    app.species = Species::ALL[next(Species::ALL.len())];
+    app.female = next(2) == 1;
+    let lists = catalog.get(app.species, app.female);
+    app.hair = next(lists.hair.len() + 1);
+    app.beard = if app.female { 0 } else { next(lists.beard.len() + 1) };
+    app.eyes = next(lists.eyes.len());
+    app.accessory = if next(3) == 0 { next(lists.accessory.len() + 1) } else { 0 };
+}
+
+fn handle_creator_buttons(
+    interactions: Query<(&Interaction, &CreatorAction), Changed<Interaction>>,
+    mut menu: ResMut<CreatorMenu>,
+    mut appearance: ResMut<CharacterAppearance>,
+    catalog: Res<AppearanceCatalog>,
+) {
+    for (interaction, action) in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match *action {
+            CreatorAction::Step(field, delta) => {
+                let mut next = appearance.clone();
+                step_field(&mut next, &catalog, field, delta);
+                appearance.set_if_neq(next);
+            }
+            CreatorAction::Randomize => {
+                let mut next = appearance.clone();
+                randomize(&mut next, &catalog);
+                appearance.set_if_neq(next);
+            }
+            CreatorAction::Close => menu.open = false,
+        }
+        save_appearance(&appearance);
+    }
+}
+
+fn refresh_creator(
+    menu: Res<CreatorMenu>,
+    appearance: Res<CharacterAppearance>,
+    catalog: Res<AppearanceCatalog>,
+    mut roots: Query<&mut Visibility, With<CreatorRoot>>,
+    mut buttons: Query<(&Interaction, &mut BackgroundColor), With<CreatorAction>>,
+    mut texts: Query<(&FieldText, &mut TextSpan)>,
+) {
+    let wanted = if menu.open { Visibility::Inherited } else { Visibility::Hidden };
+    for mut visibility in &mut roots {
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+    if !menu.open {
+        return;
+    }
+
+    for (interaction, mut background) in &mut buttons {
+        let color = match *interaction {
+            Interaction::Pressed => BTN_PRESSED,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_NORMAL,
+        };
+        if background.0 != color {
+            background.0 = color;
+        }
+    }
+
+    if menu.is_changed() || appearance.is_changed() {
+        let lists = catalog.get(appearance.species, appearance.female);
+        let optional = |index: usize, total: usize| {
+            if index == 0 {
+                "None".to_string()
+            } else {
+                format!("{index}/{total}")
+            }
+        };
+        for (field, mut span) in &mut texts {
+            **span = match field.0 {
+                Field::Species => appearance.species.label().to_string(),
+                Field::Sex => (if appearance.female { "Female" } else { "Male" }).to_string(),
+                Field::Hair => optional(appearance.hair, lists.hair.len()),
+                Field::Beard => optional(appearance.beard, lists.beard.len()),
+                Field::Eyes => {
+                    if lists.eyes.is_empty() {
+                        "None".to_string()
+                    } else {
+                        format!("{}/{}", appearance.eyes + 1, lists.eyes.len())
+                    }
+                }
+                Field::Accessory => optional(appearance.accessory, lists.accessory.len()),
+            };
+        }
+    }
+}

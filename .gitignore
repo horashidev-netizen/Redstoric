@@ -1,0 +1,51 @@
+# ── Build ──
+/target
+**/target/
+**/*.rs.bk
+*.pdb
+
+# ── Asset sinh ra (giữ nguyên từ trước) ──
+assets/placeholders/glb/**
+
+# ── Công cụ dump nội bộ ──
+dump_code.py
+project_dump.md
+
+# ── File backup khi chỉnh sửa ──
+*.bak
+*.bak[0-9]*
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+*.tmp
+
+# ── Bí mật / chứng chỉ / khoá (KHÔNG BAO GIỜ commit) ──
+server_cert.pem
+server_key.pem
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.env
+.env.*
+*.secret
+secrets.*
+credentials*.json
+
+# ── Dữ liệu cục bộ của người chơi ──
+character_appearance.json
+graphics_settings.json
+saves/
+*.log
+
+# ── IDE / hệ điều hành ──
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+assets
