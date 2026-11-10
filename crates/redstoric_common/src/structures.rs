@@ -6,11 +6,12 @@
 //! để nhà và đấu trường đứng vững. Mọi thứ đều là hàm thuần của toạ độ thế giới nên các chunk
 //! kề nhau tự khớp mà không cần dữ liệu chung.
 
-use bevy::math::{Quat, Vec3};
+use bevy_math::{Quat, Vec3};
 
 use crate::block::BlockType;
 use crate::chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
 use crate::generation::WorldGenerator;
+use crate::npc::Profession;
 use crate::sprites::{pick, pick_where, sprite};
 use crate::{PropSpawnData, WorldPropKind};
 
@@ -41,6 +42,14 @@ pub struct Site {
 }
 
 impl Site {
+    /// Tên hiển thị của khu (làng có tên riêng sinh từ hạt giống).
+    pub fn name(&self) -> String {
+        match self.kind {
+            SiteKind::Village => crate::npc::village_name(self.seed),
+            SiteKind::BossArena => "Boss Arena".to_string(),
+        }
+    }
+
     #[inline]
     pub fn dist(&self, wx: i32, wz: i32) -> f32 {
         let dx = (wx - self.x) as f32;
@@ -268,6 +277,29 @@ fn add_sprite(
     props.push(PropSpawnData { kind, world_pos: Vec3::new(x, y, z), rotation: Quat::from_rotation_y(yaw) });
 }
 
+/// Thêm một dân làng (điểm đứng là mặt đất) nếu nằm trong chunk đang sinh.
+#[allow(clippy::too_many_arguments)]
+fn add_villager(
+    props: &mut Vec<PropSpawnData>,
+    ox: i32,
+    oz: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+    yaw: f32,
+    seed: u32,
+    job: Profession,
+) {
+    if !in_chunk(ox, oz, x.floor() as i32, z.floor() as i32) {
+        return;
+    }
+    props.push(PropSpawnData {
+        kind: WorldPropKind::Villager { seed, job: job.index() },
+        world_pos: Vec3::new(x, y, z),
+        rotation: Quat::from_rotation_y(yaw),
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Làng
 // ---------------------------------------------------------------------------------------------
@@ -356,9 +388,138 @@ fn build_village(chunk: &mut ChunkData, ox: i32, oz: i32, site: &Site, props: &m
         build_house(chunk, ox, oz, by, &house, props);
     }
 
-    // Ruộng bao quanh làng, nằm giữa các hướng nhà
+    // Ruộng bao quanh làng, nằm giữa các hướng nhà; có hàng rào, cổng quay về làng và một nông dân
     for (px, pz, kind) in village_fields(site) {
         build_field(chunk, ox, oz, by, px, pz, kind, props);
+        build_fence(chunk, ox, oz, by, px, pz, site, props);
+        let vs = hash2(px, pz, site.seed ^ 0x77);
+        add_villager(
+            props, ox, oz,
+            px as f32 + 0.5, y, (pz + 6) as f32 + 0.5,
+            (vs % 628) as f32 / 100.0, vs, Profession::Farmer,
+        );
+    }
+
+    // Dân làng ở quảng trường: 3-5 người, mỗi người một nghề
+    const SPOTS: [(i32, i32); 5] = [(0, 2), (2, -1), (-2, -1), (-3, 2), (3, 2)];
+    const JOBS: [Profession; 7] = [
+        Profession::Merchant,
+        Profession::Blacksmith,
+        Profession::Alchemist,
+        Profession::Innkeeper,
+        Profession::Guard,
+        Profession::Cook,
+        Profession::Hunter,
+    ];
+    let n = 3 + ((site.seed >> 5) % 3) as usize;
+    for i in 0..n {
+        let (dx, dz) = SPOTS[i];
+        let vs = hash2(site.x + dx, site.z + dz, site.seed);
+        let job = JOBS[(i + site.seed as usize) % JOBS.len()];
+        add_villager(
+            props, ox, oz,
+            (site.x + dx) as f32 + 0.5, y, (site.z + dz) as f32 + 0.5,
+            (vs % 628) as f32 / 100.0, vs, job,
+        );
+    }
+
+    build_airship(chunk, ox, oz, site);
+}
+
+/// Hàng rào quanh thửa ruộng: cột gỗ cao 2 khối cách nhau một ô, thanh ngang giữa các cột,
+/// chừa cổng ở cạnh quay về tâm làng và cắm một đèn đường cạnh cổng.
+#[allow(clippy::too_many_arguments)]
+fn build_fence(
+    chunk: &mut ChunkData,
+    ox: i32,
+    oz: i32,
+    by: i32,
+    px: i32,
+    pz: i32,
+    site: &Site,
+    props: &mut Vec<PropSpawnData>,
+) {
+    let to_x = site.x - px;
+    let to_z = site.z - pz;
+    let gate_on_x = to_x.abs() >= to_z.abs();
+    let gx = px + 5 * to_x.signum().max(-1).min(1);
+    let gz = pz + 4 * to_z.signum().max(-1).min(1);
+    for x in (px - 5)..=(px + 5) {
+        for z in (pz - 4)..=(pz + 4) {
+            let edge = x == px - 5 || x == px + 5 || z == pz - 4 || z == pz + 4;
+            let corner = (x == px - 5 || x == px + 5) && (z == pz - 4 || z == pz + 4);
+            if !edge || corner {
+                continue;
+            }
+            let in_gate = if gate_on_x { x == gx && (z - pz).abs() <= 1 } else { z == gz && (x - px).abs() <= 1 };
+            if in_gate {
+                continue;
+            }
+            if (x + z).rem_euclid(2) == 0 {
+                set_world(chunk, ox, oz, x, by + 1, z, BlockType::Wood);
+                set_world(chunk, ox, oz, x, by + 2, z, BlockType::Wood);
+            } else {
+                set_world(chunk, ox, oz, x, by + 1, z, BlockType::Planks);
+            }
+        }
+    }
+    // Đèn đường ngoài cổng
+    let (lx, lz) = if gate_on_x {
+        (gx + to_x.signum(), pz + 2)
+    } else {
+        (px + 2, gz + to_z.signum())
+    };
+    add_sprite(props, ox, oz, sprite("misc/street_lamp"), lx as f32 + 0.5, by as f32 + 1.0, lz as f32 + 0.5, 0.0);
+}
+
+/// Khinh khí cầu bằng khối lơ lửng trên trời: thân hình bầu dục bằng ván có vòng gỗ,
+/// thuyền treo bên dưới và cánh quạt ở đuôi. Mỗi làng một chiếc, hướng theo hạt giống.
+fn build_airship(chunk: &mut ChunkData, ox: i32, oz: i32, site: &Site) {
+    let h = hash2(site.x, site.z, site.seed ^ 0xa1f5);
+    let ang = (h % 628) as f32 / 100.0;
+    let cx = site.x + (ang.cos() * 24.0).round() as i32;
+    let cz = site.z + (ang.sin() * 24.0).round() as i32;
+    let cy = (site.base_y + 30).min(CHUNK_SIZE_Y as i32 - 9);
+    let along_x = (h >> 12) & 1 == 0;
+    // Toạ độ cục bộ (dọc thân, cao, ngang thân) -> toạ độ thế giới
+    let mut put = |l: i32, u: i32, w: i32, b: BlockType| {
+        let (wx, wz) = if along_x { (cx + l, cz + w) } else { (cx + w, cz + l) };
+        set_world(chunk, ox, oz, wx, cy + u, wz, b);
+    };
+    // Thân
+    for l in -11..=11i32 {
+        for u in -5..=5i32 {
+            for w in -5..=5i32 {
+                let d = (l as f32 / 11.0).powi(2) + (u as f32 / 4.6).powi(2) + (w as f32 / 4.6).powi(2);
+                if d > 1.0 {
+                    continue;
+                }
+                let ring = l.rem_euclid(5) == 0;
+                let keel = u == -4 && w == 0;
+                let b = if ring || keel { BlockType::Wood } else { BlockType::Planks };
+                put(l, u, w, b);
+            }
+        }
+    }
+    // Thuyền treo bên dưới
+    for l in -4..=4i32 {
+        for u in -8..=-6i32 {
+            for w in -1..=1i32 {
+                let wall = l.abs() == 4 || w.abs() == 1 || u == -8;
+                put(l, u, w, if wall { BlockType::Wood } else { BlockType::Planks });
+            }
+        }
+    }
+    for (l, w) in [(-3, -1), (3, -1), (-3, 1), (3, 1)] {
+        put(l, -5, w, BlockType::Wood);
+    }
+    // Cánh quạt chữ thập ở đuôi và vây đuôi
+    for k in -2..=2i32 {
+        put(12, k, 0, BlockType::Wood);
+        put(12, 0, k, BlockType::Wood);
+    }
+    for k in 0..=3i32 {
+        put(-11 - 1, k, 0, BlockType::Wood);
     }
 }
 

@@ -5,5 +5,4 @@ edition = "2024"
 
 [dependencies]
 bevy = { workspace = true }
-noise = "0.9"
-serde_json = { workspace = true }
+redstoric_common = { path = "../redstoric_common" }

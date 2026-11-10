@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/redstoric_common",
     "crates/redstoric_core",
     "crates/redstoric_voxel",
     "crates/redstoric_combat_ai",
@@ -12,6 +13,7 @@ resolver = "2"
 bevy = { version = "0.20.1", default-features = false, features = [
     "bevy_render",
     "bevy_core_pipeline",
+    "bevy_post_process",
     "bevy_pbr",
     "bevy_asset",
     "bevy_winit",
@@ -23,6 +25,7 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "bevy_ui_render",
     "bevy_sprite",
     "bevy_audio",
+    "vorbis",
     "bevy_gilrs",
     "png",
     "hdr",
@@ -37,6 +40,9 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "bevy_log",
     "reflect_auto_register",
 ] }
+bevy_math  = "0.20.1"
+bevy_ecs   = "0.20.1"
+noise      = "0.9"
 dot_vox   = "5.2.0"
 glam      = "0.34.2"
 gltf      = "1.4.1"
@@ -52,8 +58,15 @@ version = "0.1.0"
 edition = "2024"
 default-run = "Redstoric"
 
+# Thư viện chứa toàn bộ game: desktop gọi từ src/main.rs, Android nạp trực tiếp (cdylib).
+[lib]
+name = "redstoric_game"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 bevy               = { workspace = true }
+redstoric_common   = { path = "crates/redstoric_common" }
 redstoric_core     = { path = "crates/redstoric_core" }
 redstoric_voxel    = { path = "crates/redstoric_voxel" }
 redstoric_combat_ai = { path = "crates/redstoric_combat_ai" }
@@ -61,6 +74,27 @@ redstoric_net      = { path = "crates/redstoric_net" }
 dot_vox    = { workspace = true }
 walkdir    = { workspace = true }
 serde_json = { workspace = true }
+
+# Android: dùng NativeActivity (build bằng `cargo apk build`, xem README mục "Chạy trên điện thoại").
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { workspace = true, features = ["android-native-activity"] }
+
+[package.metadata.android]
+package = "org.redstoric.game"
+apk_label = "Redstoric"
+# Thư mục asset đã lọc nhẹ, sinh bởi tools/pack_mobile_assets.py (bản đầy đủ gần 1 GB, quá nặng cho APK)
+assets = "target/mobile_assets"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 33
+
+[package.metadata.android.application.activity]
+orientation = "landscape"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
 
 # dev: link động (build nhanh) + tên kiểu trong thông báo panic. KHÔNG bật khi release.
 # Chạy: cargo run --features dev

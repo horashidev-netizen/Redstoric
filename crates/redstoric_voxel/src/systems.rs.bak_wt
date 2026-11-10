@@ -1,0 +1,346 @@
+use bevy::prelude::*;
+use crate::prop::{NightLamp, BossSpawnPoint, PropSpawnData, VillagerSpawn, WorldProp, WorldPropKind};
+use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
+use crate::chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Z};
+use crate::map::VoxelWorldMap;
+use crate::meshing::build_greedy_mesh;
+use crate::worldgen::CHUNK_SIZE_Y;
+use crate::preload::{PreloadedProps, WorldPreload};
+use crate::WorldGenerator;
+use redstoric_common::chunk_in_world;
+/// Đánh dấu Entity là tâm điểm để hệ thống stream chunk xung quanh (thường gắn vào Player)
+#[derive(Component, Default)]
+pub struct VoxelViewer;
+
+/// Khoảng cách stream chunk (đơn vị: chunk). Có thể đổi lúc đang chạy,
+/// được `GraphicsPlugin` điều khiển theo mức chất lượng.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct VoxelStreamSettings {
+    /// Bán kính tải chunk quanh người chơi (Load Radius)
+    pub load_distance: i32,
+    /// Bán kính dỡ bỏ chunk (Unload Radius) - luôn lớn hơn load để chống lag kiểu Veloren
+    pub unload_distance: i32,
+    /// Chỉ spawn props (hoa, bụi, khúc gỗ, rương) cho chunk nằm trong bán kính này
+    pub prop_distance: i32,
+}
+
+impl Default for VoxelStreamSettings {
+    fn default() -> Self {
+        Self { load_distance: 7, unload_distance: 9, prop_distance: 4 }
+    }
+}
+#[derive(Component)]
+pub struct ChunkComponent {
+    pub coord: IVec2,
+}
+#[derive(Resource)]
+pub struct TerrainMaterial(pub Handle<StandardMaterial>);
+
+/// Component chứa tác vụ tính toán Noise & Mesh ngầm trên CPU Worker Thread
+#[derive(Component)]
+/// `Option<ChunkData>`: `Some` khi chunk vừa được sinh mới (ngoài biên thế giới hoặc tắt tải trước),
+/// `None` khi chunk đã có sẵn trong `VoxelWorldMap` và chỉ cần dựng mesh.
+pub struct ChunkGenTask(pub Task<(i32, i32, Option<ChunkData>, Mesh, Vec<PropSpawnData>)>);
+/// Khởi tạo Material địa hình lúc khởi động game
+pub fn setup_voxel_world(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let material = materials.add(StandardMaterial {
+        base_color: Color::WHITE, // Giữ màu trắng để nhân 1:1 với màu đỉnh (Vertex Color)
+        perceptual_roughness: 0.9,
+        reflectance: 0.05,
+        cull_mode: Some(bevy::render::render_resource::Face::Back),
+        ..default()
+    });
+    commands.insert_resource(TerrainMaterial(material));
+}
+/// Giữ người chơi trong biên thế giới hữu hạn.
+pub fn clamp_viewer_to_world(mut q: Query<&mut Transform, With<VoxelViewer>>) {
+    let lim = redstoric_common::WORLD_LIMIT;
+    for mut t in &mut q {
+        let c = Vec3::new(t.translation.x.clamp(-lim, lim), t.translation.y, t.translation.z.clamp(-lim, lim));
+        if c != t.translation {
+            t.translation = c;
+        }
+    }
+}
+
+/// Hệ thống quét tọa độ người chơi: Sinh chunk mới và xóa chunk ở quá xa
+pub fn chunk_streaming_system(
+    mut commands: Commands,
+    generator: Res<WorldGenerator>,
+    mut voxel_map: ResMut<VoxelWorldMap>,
+    // Lấy vị trí của bất kỳ entity nào có gắn VoxelViewer
+    viewer_query: Query<&Transform, With<VoxelViewer>>,
+    settings: Res<VoxelStreamSettings>,
+    preload: Res<WorldPreload>,
+    props_cache: Res<PreloadedProps>,
+) {
+    let Ok(viewer_transform) = viewer_query.single() else { return; };
+    let load_distance = settings.load_distance;
+    let unload_distance = settings.unload_distance;
+
+    let player_cx = (viewer_transform.translation.x / CHUNK_SIZE_X as f32).floor() as i32;
+    let player_cz = (viewer_transform.translation.z / CHUNK_SIZE_Z as f32).floor() as i32;
+
+    let pool = AsyncComputeTaskPool::get();
+
+    // 1. Quét tìm các chunk cần sinh trong bán kính load_distance
+    let mut chunks_to_load = Vec::new();
+    for dx in -load_distance..=load_distance {
+        for dz in -load_distance..=load_distance {
+            if dx * dx + dz * dz <= load_distance * load_distance {
+                let coord = (player_cx + dx, player_cz + dz);
+                if !voxel_map.chunk_entities.contains_key(&coord) && !voxel_map.loading_chunks.contains(&coord) {
+                    let dist_sq = dx * dx + dz * dz;
+                    chunks_to_load.push((dist_sq, coord));
+                }
+            }
+        }
+    }
+
+    // Ưu tiên tải từ gần đến xa
+    chunks_to_load.sort_by_key(|(dist, _)| *dist);
+
+    // Bắn tác vụ sang các luồng worker. Chunk đã có dữ liệu (tải trước) chỉ cần dựng mesh;
+    // chunk chưa có (ngoài biên thế giới, hoặc tắt tải trước) thì sinh mới rồi dựng mesh.
+    for (_, coord) in chunks_to_load.into_iter().take(MAX_NEW_TASKS_PER_FRAME) {
+        voxel_map.loading_chunks.insert(coord);
+        let cached = voxel_map.chunks.get(&coord).cloned();
+        let cached_props = props_cache.0.get(&coord).cloned();
+        let world_gen = generator.clone();
+
+        let task = pool.spawn(async move {
+            match cached {
+                Some(chunk) => {
+                    let mesh = build_greedy_mesh(&chunk).unwrap();
+                    (coord.0, coord.1, None, mesh, cached_props.unwrap_or_default())
+                }
+                None => {
+                    let (chunk, props) = world_gen.generate_chunk_with_props(coord.0, coord.1);
+                    let mesh = build_greedy_mesh(&chunk).unwrap();
+                    (coord.0, coord.1, Some(chunk), mesh, props)
+                }
+            }
+        });
+
+        commands.spawn(ChunkGenTask(task));
+    }
+
+    // 2. Dỡ bỏ (Despawn) các chunk nằm ngoài bán kính unload_distance
+    let mut chunks_to_remove = Vec::new();
+    for &coord in voxel_map.chunk_entities.keys() {
+        let dx = coord.0 - player_cx;
+        let dz = coord.1 - player_cz;
+        if dx * dx + dz * dz > unload_distance * unload_distance {
+            chunks_to_remove.push(coord);
+        }
+    }
+
+    for coord in chunks_to_remove {
+        if let Some(entity) = voxel_map.chunk_entities.remove(&coord) {
+            commands.entity(entity).despawn();
+        }
+        // Chunk trong biên thế giới đã tải trước thì giữ dữ liệu (va chạm, minimap, dựng lại nhanh).
+        if !(preload.keep_data && chunk_in_world(coord.0, coord.1)) {
+            voxel_map.chunks.remove(&coord);
+        }
+    }
+}
+
+/// Số chunk tối đa được nhận từ worker mỗi frame, tránh giật khi nhiều chunk xong cùng lúc
+const MAX_CHUNKS_PER_FRAME: usize = 4;
+/// Số tác vụ dựng mesh mới bắn đi mỗi frame
+const MAX_NEW_TASKS_PER_FRAME: usize = 6;
+/// Số chunk được spawn props mỗi frame
+const MAX_PROP_CHUNKS_PER_FRAME: usize = 1;
+
+/// Props của một chunk, chờ được spawn khi người chơi đến đủ gần (xem `prop_distance`).
+/// Mỗi prop là một scene GLB riêng nên spawn hết ở xa sẽ tốn CPU mà không ai nhìn thấy.
+#[derive(Component)]
+pub struct PendingProps(pub Vec<PropSpawnData>);
+
+/// Thu gom kết quả từ Worker Threads và render lên màn hình
+pub fn handle_chunk_tasks(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut ChunkGenTask)>,
+    mut voxel_map: ResMut<VoxelWorldMap>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    material: Option<Res<TerrainMaterial>>,
+) {
+    let Some(material) = material else { return; };
+    let mut accepted = 0;
+
+    for (task_entity, mut task) in &mut tasks {
+        if accepted >= MAX_CHUNKS_PER_FRAME {
+            break;
+        }
+        if let Some((cx, cz, chunk, mesh, props)) = block_on(future::poll_once(&mut task.0)) {
+            accepted += 1;
+            if let Some(chunk) = chunk {
+                voxel_map.chunks.insert((cx, cz), chunk);
+            }
+            voxel_map.loading_chunks.remove(&(cx, cz));
+
+            // Spawn chunk địa hình. `ChunkComponent` giúp các hệ thống khác (vd. sửa vật liệu
+            // nhân vật) nhận ra và bỏ qua địa hình; props được spawn sau bởi `spawn_chunk_props`.
+            let chunk_entity = commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(material.0.clone()),
+                Transform::from_xyz(
+                    (cx * CHUNK_SIZE_X as i32) as f32,
+                    0.0,
+                    (cz * CHUNK_SIZE_Z as i32) as f32,
+                ),
+                ChunkComponent { coord: IVec2::new(cx, cz) },
+                PendingProps(props),
+            )).id();
+
+            voxel_map.chunk_entities.insert((cx, cz), chunk_entity);
+            commands.entity(task_entity).despawn();
+        }
+    }
+}
+
+/// Spawn props cho các chunk đã nằm trong `prop_distance`, gần trước xa sau, mỗi frame một chunk
+pub fn spawn_chunk_props(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    settings: Res<VoxelStreamSettings>,
+    viewer_query: Query<&Transform, With<VoxelViewer>>,
+    mut chunks: Query<(Entity, &ChunkComponent, &mut PendingProps)>,
+) {
+    let Ok(viewer) = viewer_query.single() else { return; };
+    let player_cx = (viewer.translation.x / CHUNK_SIZE_X as f32).floor() as i32;
+    let player_cz = (viewer.translation.z / CHUNK_SIZE_Z as f32).floor() as i32;
+    let max_dist_sq = settings.prop_distance * settings.prop_distance;
+
+    let mut ready: Vec<(i32, Entity)> = chunks
+        .iter()
+        .filter_map(|(entity, chunk, _)| {
+            let dx = chunk.coord.x - player_cx;
+            let dz = chunk.coord.y - player_cz;
+            let dist_sq = dx * dx + dz * dz;
+            (dist_sq <= max_dist_sq).then_some((dist_sq, entity))
+        })
+        .collect();
+    if ready.is_empty() {
+        return;
+    }
+    ready.sort_by_key(|(dist, _)| *dist);
+
+    for (_, entity) in ready.into_iter().take(MAX_PROP_CHUNKS_PER_FRAME) {
+        let Ok((_, chunk, mut pending)) = chunks.get_mut(entity) else { continue; };
+        let props = std::mem::take(&mut pending.0);
+        let chunk_origin = Vec3::new(
+            (chunk.coord.x * CHUNK_SIZE_X as i32) as f32,
+            0.0,
+            (chunk.coord.y * CHUNK_SIZE_Z as i32) as f32,
+        );
+
+        commands.entity(entity).remove::<PendingProps>().with_children(|parent| {
+            for prop in props {
+                if prop.kind == WorldPropKind::BossSpawn {
+                    parent.spawn((
+                        Transform::default(),
+                        Visibility::default(),
+                        BossSpawnPoint { home: prop.world_pos },
+                    ));
+                    continue;
+                }
+                if let WorldPropKind::Villager { seed, job } = prop.kind {
+                    parent.spawn((
+                        Transform::from_translation(prop.world_pos - chunk_origin).with_rotation(prop.rotation),
+                        Visibility::default(),
+                        VillagerSpawn { seed, job },
+                    ));
+                    continue;
+                }
+                let glb_path = prop.kind.glb_asset_path();
+                // Đèn: thêm một PointLight ấm, bật ban đêm
+                let lamp = if glb_path.contains("street_lamp") {
+                    Some((2.6, 220_000.0, 18.0))
+                } else if glb_path.contains("lantern") || glb_path.contains("lamp_") {
+                    Some((0.9, 90_000.0, 10.0))
+                } else if glb_path.contains("candle") {
+                    Some((0.6, 40_000.0, 6.0))
+                } else {
+                    None
+                };
+                if let Some((h, intensity, range)) = lamp {
+                    parent.spawn((
+                        PointLight {
+                            color: Color::srgb(1.0, 0.72, 0.42),
+                            intensity: 0.0,
+                            range,
+                            shadow_maps_enabled: false,
+                            ..default()
+                        },
+                        Transform::from_translation(prop.world_pos - chunk_origin + Vec3::Y * h),
+                        Visibility::Hidden,
+                        NightLamp { intensity },
+                    ));
+                }
+                let scene_handle = asset_server.load(
+                    GltfAssetLabel::Scene(0).from_asset(glb_path),
+                );
+
+                parent.spawn((
+                    WorldAssetRoot(scene_handle),
+                    Transform::from_translation(
+                        prop.world_pos - chunk_origin + Vec3::Y * prop.kind.ground_offset(),
+                    )
+                        .with_rotation(prop.rotation)
+                        .with_scale(prop.kind.scale()),
+                    WorldProp,
+                ));
+            }
+        });
+    }
+}
+
+pub fn spawn_chunks_around_player(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    world_gen: Res<WorldGenerator>,
+    existing_chunks: Query<&ChunkComponent>,
+) {
+    // Test trước một cụm 3x3 chunks quanh tọa độ (0, 0)
+    let render_distance = 1;
+
+    for cx in -render_distance..=render_distance {
+        for cy in -render_distance..=render_distance {
+            let coord = IVec2::new(cx, cy);
+
+            // Bỏ qua nếu chunk này đã được spawn
+            if existing_chunks.iter().any(|c| c.coord == coord) {
+                continue;
+            }
+
+            // 1. Sinh dữ liệu voxel cho chunk
+            let chunk_data = world_gen.generate_chunk(cx, cy);
+            // 2. Chuyển mảng khối thành Mesh 3D
+            if let Some(mesh) = crate::meshing::generate_chunk_mesh(&chunk_data) {
+                let world_pos = Vec3::new(
+                    (cx * CHUNK_SIZE_X as i32) as f32,
+                    0.0,
+                    (cy * CHUNK_SIZE_Y as i32) as f32,
+                );
+
+                // 3. Spawn Mesh ra Scene (Bevy 0.15+ dùng Mesh3d & MeshMaterial3d)
+                commands.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: 0.9,
+                        ..default()
+                    })),
+                    Transform::from_translation(world_pos),
+                    ChunkComponent { coord },
+                ));
+            }
+        }
+    }
+}

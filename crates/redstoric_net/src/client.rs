@@ -19,8 +19,12 @@ use bevy_quinnet::client::{
     ClientConnectionConfiguration, ClientConnectionConfigurationDefaultables, QuinnetClient, QuinnetClientPlugin,
 };
 use redstoric_combat_ai::boss::{Boss, BossState, DEATH_TIME};
+use redstoric_combat_ai::ranged::{spawn_remote_fx, BurstFx, FxAssets, FxKind, ProjKind, Projectile, RemoteFx};
 use redstoric_combat_ai::{Health, OnlineMode, PendingBossHits};
 use redstoric_core::character_creator::CharacterAppearance;
+use redstoric_core::daynight::{EnvSync, TimeOfDay};
+use redstoric_core::weapons::{Loadout, WEAPONS};
+use redstoric_core::weather::Weather;
 use redstoric_core::Character;
 use redstoric_voxel::{VoxelWorldMap, WORLD_SEED};
 
@@ -40,8 +44,10 @@ pub struct NetConfig {
 impl NetConfig {
     /// `--connect 192.168.1.5:6000 --name Tam`, hoặc `REDSTORIC_SERVER` / `REDSTORIC_NAME`.
     pub fn from_args() -> Self {
-        let mut server = std::env::var("REDSTORIC_SERVER").ok();
-        let mut name = std::env::var("REDSTORIC_NAME").ok();
+        // Điện thoại không có dòng lệnh: địa chỉ server được "nướng" vào APK lúc build bằng
+        // `REDSTORIC_DEFAULT_SERVER=ip:6000 cargo apk build` (xem README).
+        let mut server = std::env::var("REDSTORIC_SERVER").ok().or_else(|| option_env!("REDSTORIC_DEFAULT_SERVER").map(String::from));
+        let mut name = std::env::var("REDSTORIC_NAME").ok().or_else(|| option_env!("REDSTORIC_DEFAULT_NAME").map(String::from));
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -88,6 +94,14 @@ pub struct RemotePlayer {
     target: Vec3,
     yaw: f32,
     initialized: bool,
+    class: u8,
+    attacking: bool,
+}
+
+/// Thanh vũ khí trên tay người chơi từ xa: màu theo chức nghiệp, vung khi đang đánh.
+#[derive(Component)]
+struct RemoteWeapon {
+    material: Handle<StandardMaterial>,
 }
 
 /// Vị trí đích (mặt phẳng XZ) của boss, lấy từ server; độ cao do client dò theo địa hình.
@@ -119,6 +133,8 @@ impl Plugin for NetClientPlugin {
                     smooth_remote_entities,
                     send_state,
                     send_boss_hits,
+                    send_fx,
+                    update_remote_weapons,
                     send_appearance,
                     update_status_ui,
                 )
@@ -173,6 +189,7 @@ fn handle_connection_events(
     mut client: ResMut<QuinnetClient>,
     mut net: ResMut<NetClient>,
     mut online: ResMut<OnlineMode>,
+    mut env_sync: ResMut<EnvSync>,
     config: Res<NetConfig>,
     appearance: Option<Res<CharacterAppearance>>,
 ) {
@@ -192,10 +209,12 @@ fn handle_connection_events(
     for ev in failed.read() {
         warn!("Kết nối thất bại: {:?}", ev.err);
         reset_session(&mut commands, &mut net, &mut online, NetStatus::Failed(format!("{:?}", ev.err)));
+        env_sync.active = false;
     }
     for _ in lost.read() {
         warn!("Mất kết nối tới server, chuyển về chơi offline");
         reset_session(&mut commands, &mut net, &mut online, NetStatus::Offline);
+        env_sync.active = false;
     }
 }
 
@@ -213,6 +232,10 @@ fn handle_server_messages(
     mut player: Query<(&mut Transform, &mut Character, &mut Health)>,
     mut bosses: Query<(Entity, &mut Boss, &mut Health, Option<&mut NetBossTarget>), Without<Character>>,
     mut remotes: Query<&mut RemotePlayer>,
+    mut tod: ResMut<TimeOfDay>,
+    mut weather: ResMut<Weather>,
+    mut env_sync: ResMut<EnvSync>,
+    fx_assets: Option<Res<FxAssets>>,
 ) {
     let mut inbox: Vec<ServerMsg> = Vec::new();
     {
@@ -230,6 +253,7 @@ fn handle_server_messages(
                 net.my_id = Some(your_id);
                 net.status = NetStatus::Online;
                 online.0 = true;
+                env_sync.active = true;
                 info!("Đã vào server, id của bạn là #{your_id}");
                 if seed != WORLD_SEED {
                     warn!("Hạt giống thế giới khác server ({seed} != {WORLD_SEED}): địa hình sẽ không khớp!");
@@ -257,6 +281,18 @@ fn handle_server_messages(
             }
             // Ngoại hình người khác đã nhận nhưng hiện chưa dùng: người chơi từ xa còn là mô hình tạm.
             ServerMsg::PlayerAppearance { .. } => {}
+            ServerMsg::Env { hour, rain } => {
+                tod.hour = hour.rem_euclid(24.0);
+                weather.target = rain.clamp(0.0, 1.0);
+            }
+            ServerMsg::Fx { id, kind, pos, dir } => {
+                if Some(id) == net.my_id {
+                    continue;
+                }
+                if let Some(assets) = fx_assets.as_ref() {
+                    spawn_remote_fx(&mut commands, &mut materials, assets, kind, Vec3::from(pos), Vec3::from(dir).normalize_or_zero());
+                }
+            }
             ServerMsg::Teleport { pos } => {
                 if let Ok((mut tf, mut character, _)) = player.single_mut() {
                     tf.translation = Vec3::from(pos);
@@ -281,6 +317,8 @@ fn handle_server_messages(
                     if let Ok(mut remote) = remotes.get_mut(*entity) {
                         remote.target = Vec3::from(state.pos);
                         remote.yaw = state.yaw;
+                        remote.class = state.class;
+                        remote.attacking = state.attacking;
                     }
                 }
                 for data in boss_list {
@@ -336,7 +374,7 @@ fn spawn_remote(
         .spawn((
             Transform::from_xyz(0.0, -1000.0, 0.0), // ẩn cho tới khi nhận vị trí đầu tiên
             Visibility::default(),
-            RemotePlayer { id, target: Vec3::new(0.0, -1000.0, 0.0), yaw: 0.0, initialized: false },
+            RemotePlayer { id, target: Vec3::new(0.0, -1000.0, 0.0), yaw: 0.0, initialized: false, class: 0, attacking: false },
             Name::new(format!("Remote {name}")),
         ))
         .with_children(|p| {
@@ -347,6 +385,14 @@ fn spawn_remote(
             p.spawn(part(&torso, 1.1, 0.0));
             p.spawn(part(&head, 1.75, 0.0));
             p.spawn(part(&nose, 1.75, -0.3));
+            // Vũ khí cầm ở tay phải (thanh dài, đổi màu theo chức nghiệp)
+            let wmat = materials.add(StandardMaterial { base_color: Color::WHITE, unlit: true, ..default() });
+            p.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.1, 0.1, 1.1))),
+                MeshMaterial3d(wmat.clone()),
+                Transform::from_xyz(0.55, 1.0, -0.4),
+                RemoteWeapon { material: wmat },
+            ));
         })
         .id()
 }
@@ -396,7 +442,8 @@ fn send_state(
     mut last: Local<Option<Vec3>>,
     net: Res<NetClient>,
     mut client: ResMut<QuinnetClient>,
-    player: Query<&Transform, With<Character>>,
+    loadout: Res<Loadout>,
+    player: Query<(&Transform, &Character)>,
 ) {
     if net.status != NetStatus::Online {
         return;
@@ -406,7 +453,8 @@ fn send_state(
         return;
     }
     *timer = SEND_INTERVAL;
-    let Ok(tf) = player.single() else { return };
+    let Ok((tf, ch)) = player.single() else { return };
+    let attacking = matches!(ch.state, redstoric_core::ActionState::Attacking(_));
     let pos = tf.translation;
     let previous: Option<Vec3> = *last;
     let moving = previous.map(|l| Vec2::new(pos.x - l.x, pos.z - l.z).length() > 0.02).unwrap_or(false);
@@ -415,12 +463,17 @@ fn send_state(
     if let Some(conn) = client.get_connection_mut() {
         conn.try_send_message_on(
             CH_UNRELIABLE,
-            ClientMsg::State(PlayerState { pos: pos.to_array(), yaw, moving }),
+            ClientMsg::State(PlayerState { pos: pos.to_array(), yaw, moving, class: loadout.selected as u8, attacking }),
         );
     }
 }
 
-fn send_boss_hits(net: Res<NetClient>, mut pending: ResMut<PendingBossHits>, mut client: ResMut<QuinnetClient>) {
+fn send_boss_hits(
+    net: Res<NetClient>,
+    loadout: Res<Loadout>,
+    mut pending: ResMut<PendingBossHits>,
+    mut client: ResMut<QuinnetClient>,
+) {
     if pending.0.is_empty() {
         return;
     }
@@ -430,7 +483,67 @@ fn send_boss_hits(net: Res<NetClient>, mut pending: ResMut<PendingBossHits>, mut
     }
     if let Some(conn) = client.get_connection_mut() {
         for key in pending.0.drain(..) {
-            conn.try_send_message_on(CH_RELIABLE, ClientMsg::Attack { boss: [key.x, key.y] });
+            conn.try_send_message_on(CH_RELIABLE, ClientMsg::Attack { boss: [key.x, key.y], class: loadout.selected as u8 });
+        }
+    }
+}
+
+/// Gửi lên server các đạn / hiệu ứng vũ khí do chính mình vừa tạo để người khác thấy.
+fn send_fx(
+    net: Res<NetClient>,
+    mut client: ResMut<QuinnetClient>,
+    projectiles: Query<(&Transform, &Projectile), (Added<Projectile>, Without<RemoteFx>)>,
+    bursts: Query<(&Transform, &BurstFx), (Added<BurstFx>, Without<RemoteFx>)>,
+) {
+    if net.status != NetStatus::Online {
+        return;
+    }
+    let Some(conn) = client.get_connection_mut() else { return };
+    for (tf, pr) in &projectiles {
+        let kind = match pr.kind {
+            ProjKind::Arrow => 0,
+            ProjKind::Fireball => 1,
+            ProjKind::HealBolt => 2,
+        };
+        conn.try_send_message_on(
+            CH_RELIABLE,
+            ClientMsg::Fire { kind, pos: tf.translation.to_array(), dir: tf.forward().as_vec3().to_array() },
+        );
+    }
+    for (tf, fx) in &bursts {
+        let kind = match fx.kind {
+            FxKind::Slam => 3,
+            FxKind::Spin => 4,
+            _ => continue,
+        };
+        conn.try_send_message_on(
+            CH_RELIABLE,
+            ClientMsg::Fire { kind, pos: tf.translation.to_array(), dir: [0.0, 0.0, -1.0] },
+        );
+    }
+}
+
+/// Đổi màu thanh vũ khí theo chức nghiệp và vung khi người chơi đó đang đánh.
+fn update_remote_weapons(
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    remotes: Query<(&RemotePlayer, &Children)>,
+    mut weapons: Query<(&RemoteWeapon, &mut Transform)>,
+) {
+    let t = time.elapsed_secs();
+    for (remote, children) in &remotes {
+        let def = &WEAPONS[(remote.class as usize).min(WEAPONS.len() - 1)];
+        let (r, g, b) = def.color;
+        for child in children.iter().map(|c| c.clone()) {
+            let Ok((weapon, mut tf)) = weapons.get_mut(child) else { continue };
+            if let Some(mut m) = materials.get_mut(&weapon.material) {
+                m.base_color = Color::srgb(r, g, b);
+            }
+            tf.rotation = if remote.attacking {
+                Quat::from_rotation_x(-1.0 + (t * 16.0).sin() * 0.9)
+            } else {
+                Quat::from_rotation_x(0.35)
+            };
         }
     }
 }

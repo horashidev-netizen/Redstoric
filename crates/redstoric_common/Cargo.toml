@@ -1,0 +1,11 @@
+[package]
+name = "redstoric_common"
+version = "0.1.0"
+edition = "2024"
+description = "Lõi dùng chung cho client và server: khối, chunk, sinh thế giới, cấu trúc, prop và luật chơi. Không phụ thuộc đồ hoạ."
+
+[dependencies]
+bevy_math = { workspace = true }
+bevy_ecs = { workspace = true }
+noise = { workspace = true }
+serde_json = { workspace = true }

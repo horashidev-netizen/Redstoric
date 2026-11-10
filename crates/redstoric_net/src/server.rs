@@ -14,32 +14,33 @@ use bevy_quinnet::server::{
     ConnectionEvent, ConnectionLostEvent, EndpointAddrConfiguration, QuinnetServer, QuinnetServerPlugin,
     ServerEndpointConfiguration, ServerEndpointConfigurationDefaultables,
 };
-use redstoric_voxel::structures::SiteKind;
-use redstoric_voxel::{WorldGenerator, WORLD_SEED};
+use redstoric_common::structures::SiteKind;
+use redstoric_common::{WorldGenerator, WORLD_SEED};
 
 use crate::protocol::*;
 
-// --- Luật chơi do server quyết định ---
-const BOSS_HEALTH: f32 = 500.0;
-const AGGRO_RANGE: f32 = 22.0;
-const LEASH_RANGE: f32 = 50.0;
+// --- Luật chơi do server quyết định: nguồn chung nằm ở `redstoric_common::rules` ---
+use redstoric_common::rules::{boss as rb, player as rp};
+const BOSS_HEALTH: f32 = rb::HEALTH;
+const AGGRO_RANGE: f32 = rb::AGGRO_RANGE;
+const LEASH_RANGE: f32 = rb::LEASH_RANGE;
 /// Boss không đi ra khỏi bán kính này quanh tâm đấu trường (tường đấu trường nằm ở 15.5).
-const ARENA_LIMIT: f32 = 13.0;
-const BOSS_SPEED: f32 = 3.6;
-const ATTACK_RANGE: f32 = 3.2;
-const ATTACK_DAMAGE: f32 = 20.0;
-const WINDUP: f32 = 0.7;
-const RECOVER: f32 = 1.1;
-const DEATH_TIME: f32 = 2.5;
-const BOSS_REGEN: f32 = 15.0;
+const ARENA_LIMIT: f32 = rb::ARENA_LIMIT;
+const BOSS_SPEED: f32 = rb::SPEED;
+const ATTACK_RANGE: f32 = rb::ATTACK_RANGE;
+const ATTACK_DAMAGE: f32 = rb::ATTACK_DAMAGE;
+const WINDUP: f32 = rb::WINDUP;
+const RECOVER: f32 = rb::RECOVER;
+const DEATH_TIME: f32 = rb::DEATH_TIME;
+const BOSS_REGEN: f32 = rb::REGEN;
 
-const PLAYER_DAMAGE: f32 = 25.0;
+const PLAYER_DAMAGE: f32 = rp::DAMAGE;
 /// Tầm đánh tối đa chấp nhận được (tầm chém 2.8 + bán kính boss + bù độ trễ mạng).
-const PLAYER_REACH: f32 = 7.0;
-const ATTACK_COOLDOWN: f32 = 0.3;
-const PLAYER_REGEN: f32 = 1.5;
+const PLAYER_REACH: f32 = rp::REACH;
+const ATTACK_COOLDOWN: f32 = rp::ATTACK_COOLDOWN;
+const PLAYER_REGEN: f32 = rp::REGEN;
 /// Tốc độ ngang tối đa chấp nhận (nhân vật chạy 10 m/s, chừa dư cho knockback và độ trễ).
-const MAX_SPEED: f32 = 40.0;
+const MAX_SPEED: f32 = rp::MAX_SPEED;
 const HELLO_TIMEOUT: f32 = 10.0;
 const BOSS_ACTIVATE_RADIUS: i32 = 200;
 const SNAPSHOT_BOSS_RADIUS: f32 = 300.0;
@@ -84,7 +85,28 @@ pub struct ServerWorld {
     pending: HashMap<u64, f32>,
     bosses: HashMap<[i32; 2], ServerBoss>,
     defeated: HashSet<[i32; 2]>,
+    env: ServerEnv,
 }
+
+/// Đồng hồ và thời tiết của cả thế giới (mọi người chơi thấy cùng một giờ và cùng một cơn mưa).
+struct ServerEnv {
+    hour: f32,
+    rain: f32,
+    rain_timer: f32,
+    rng: u32,
+    send_timer: f32,
+}
+
+impl Default for ServerEnv {
+    fn default() -> Self {
+        Self { hour: 9.0, rain: 0.0, rain_timer: 120.0, rng: 0x2545_f491, send_timer: 0.0 }
+    }
+}
+
+/// Một ngày dài 600 giây thực, như client offline.
+const DAY_LENGTH: f32 = 600.0;
+/// Người ở xa hơn mức này không nhận hiệu ứng vũ khí của nhau.
+const FX_RADIUS: f32 = 90.0;
 
 pub struct NetServerPlugin {
     pub port: u16,
@@ -99,7 +121,7 @@ impl Plugin for NetServerPlugin {
             .insert_resource(Time::<Fixed>::from_hz(20.0))
             .add_systems(Startup, start_listening)
             .add_systems(Update, (handle_connections, receive_messages, spawn_bosses).chain())
-            .add_systems(FixedUpdate, (simulate, send_snapshots).chain());
+            .add_systems(FixedUpdate, (simulate, advance_env, send_snapshots).chain());
     }
 }
 
@@ -213,6 +235,7 @@ fn receive_messages(time: Res<Time>, mut server: ResMut<QuinnetServer>, mut worl
                 info!("{name} (#{id}) vào server");
 
                 ep.try_send_message_on(id, CH_RELIABLE, ServerMsg::Welcome { your_id: id, seed: WORLD_SEED });
+                ep.try_send_message_on(id, CH_RELIABLE, ServerMsg::Env { hour: world.env.hour, rain: world.env.rain });
                 // Báo cho người mới biết những ai đang online, và báo cho người cũ biết có người mới
                 for (other_id, other) in &world.players {
                     ep.try_send_message_on(
@@ -262,6 +285,10 @@ fn receive_messages(time: Res<Time>, mut server: ResMut<QuinnetServer>, mut worl
                 if !state.is_valid() {
                     continue;
                 }
+                // Giữ trong biên thế giới hữu hạn
+                let mut state = state;
+                state.pos[0] = state.pos[0].clamp(-redstoric_common::WORLD_LIMIT, redstoric_common::WORLD_LIMIT);
+                state.pos[2] = state.pos[2].clamp(-redstoric_common::WORLD_LIMIT, redstoric_common::WORLD_LIMIT);
                 if !p.has_state {
                     p.state = state;
                     p.has_state = true;
@@ -282,18 +309,40 @@ fn receive_messages(time: Res<Time>, mut server: ResMut<QuinnetServer>, mut worl
                 }
             }
 
-            ClientMsg::Attack { boss } => {
+            ClientMsg::Attack { boss, class } => {
                 let Some(p) = world.players.get_mut(&id) else { continue };
-                if p.hp <= 0.0 || now - p.last_attack_t < ATTACK_COOLDOWN {
+                // Sát thương, tầm và nhịp đánh theo chức nghiệp (bảng WEAPONS dùng chung với client)
+                let def = &redstoric_core::weapons::WEAPONS[(class as usize).min(redstoric_core::weapons::WEAPONS.len() - 1)];
+                let cooldown = (def.duration * 0.6).min(ATTACK_COOLDOWN.max(0.2));
+                if p.hp <= 0.0 || now - p.last_attack_t < cooldown {
                     continue;
                 }
                 let player_xz = Vec2::new(p.state.pos[0], p.state.pos[2]);
                 p.last_attack_t = now;
                 let Some(b) = world.bosses.get_mut(&boss) else { continue };
-                if matches!(b.phase, Phase::Dying(_)) || b.pos.distance(player_xz) > PLAYER_REACH {
+                // Cận chiến: tầm chém cộng bán kính boss và độ trễ; đạn: tầm bay tối đa
+                let reach = if def.range > 20.0 { def.range + 3.0 } else { def.range + PLAYER_REACH - 2.8 };
+                if matches!(b.phase, Phase::Dying(_)) || b.pos.distance(player_xz) > reach {
                     continue;
                 }
-                b.hp = (b.hp - PLAYER_DAMAGE).max(0.0);
+                b.hp = (b.hp - def.damage.max(PLAYER_DAMAGE * 0.2)).max(0.0);
+            }
+
+            ClientMsg::Fire { kind, pos, dir } => {
+                if !world.players.contains_key(&id) || kind > 4 {
+                    continue;
+                }
+                if !pos.iter().chain(dir.iter()).all(|v| v.is_finite() && v.abs() < 1.0e6) {
+                    continue;
+                }
+                let origin = Vec2::new(pos[0], pos[2]);
+                let near: Vec<u64> = world
+                    .players
+                    .iter()
+                    .filter(|(other, p)| **other != id && Vec2::new(p.state.pos[0], p.state.pos[2]).distance(origin) < FX_RADIUS)
+                    .map(|(other, _)| *other)
+                    .collect();
+                ep.try_send_group_message_on(near.iter(), CH_RELIABLE, ServerMsg::Fx { id, kind, pos, dir });
             }
         }
     }
@@ -507,4 +556,39 @@ fn send_snapshots(world: Res<ServerWorld>, mut server: ResMut<QuinnetServer>) {
         };
         ep.try_send_message_on(*id, CH_UNRELIABLE, msg);
     }
+}
+
+/// Đồng hồ thế giới và lịch mưa; phát cho mọi người mỗi giây.
+fn advance_env(time: Res<Time>, mut world: ResMut<ServerWorld>, mut server: ResMut<QuinnetServer>) {
+    let dt = time.delta_secs();
+    let world = &mut *world;
+    let env = &mut world.env;
+    env.hour = (env.hour + dt / DAY_LENGTH * 24.0).rem_euclid(24.0);
+
+    env.rain_timer -= dt;
+    if env.rain_timer <= 0.0 {
+        let mut r = env.rng;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            (r >> 8) as f32 / 16_777_216.0
+        };
+        // Đang mưa kéo dài 1–3 phút, trời quang 2–5 phút
+        let (rain, dur) = if env.rain > 0.5 { (0.0, 120.0 + next() * 120.0) } else { (1.0, 60.0 + next() * 120.0) };
+        env.rng = r;
+        env.rain = rain;
+        env.rain_timer = dur;
+        env.send_timer = 0.0; // báo ngay
+    }
+
+    env.send_timer -= dt;
+    if env.send_timer > 0.0 || world.players.is_empty() {
+        return;
+    }
+    world.env.send_timer = 1.0;
+    let Some(ep) = server.get_endpoint_mut() else { return };
+    let msg = ServerMsg::Env { hour: world.env.hour, rain: world.env.rain };
+    let ids: Vec<u64> = world.players.keys().copied().collect();
+    ep.try_send_group_message_on(ids.iter(), CH_RELIABLE, msg);
 }

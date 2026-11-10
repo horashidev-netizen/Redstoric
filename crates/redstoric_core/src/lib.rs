@@ -1,11 +1,15 @@
 pub mod character_creator;
 pub mod character_visual;
+pub mod daynight;
 pub mod biped;
 pub mod fps_counter;
 pub mod graphics;
 pub mod graphics_menu;
 pub mod minimap;
+pub mod npc;
 pub mod voxel_material;
+pub mod weather;
+pub mod weapons;
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
@@ -16,15 +20,18 @@ use crate::biped::biped_walk_animation_system;
 pub struct CorePlugin;
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.add_plugins((npc::NpcPlugin, daynight::DayNightPlugin, weather::WeatherPlugin, weapons::WeaponPlugin)).add_systems(
             Update,
             (
                 character_controller,
                 orbit_camera_system,
                 clean_character_glb_hierarchy,
                 character_procedural_animation,
-                biped_walk_animation_system
-            ),
+                biped_walk_animation_system,
+                sprint_fov_system
+            )
+                // Chờ thế giới tải xong để nhân vật không rơi xuyên địa hình chưa có
+                .run_if(redstoric_voxel::preload::world_ready),
         );
     }
 }
@@ -34,6 +41,11 @@ pub enum ActionState {
     #[default]
     Idle,
     Running,
+    Sprinting,
+    Jumping,
+    Falling,
+    Climbing,
+    Swimming,
     Attacking(u8),
 }
 
@@ -44,6 +56,18 @@ pub struct Character {
     pub is_grounded: bool,
     pub state: ActionState,
     pub attack_timer: f32,
+    /// Độ dài nhát đánh hiện tại (giây), do vũ khí quyết định
+    pub attack_len: f32,
+    /// Giữ Shift khi di chuyển
+    pub sprinting: bool,
+    /// Thời gian đã ở trên không (giây)
+    pub air_time: f32,
+    /// Còn lại bao lâu tư thế "chạm đất" (nhún chân)
+    pub land_timer: f32,
+    /// Sức bám leo vách còn lại (giây)
+    pub climb_stamina: f32,
+    /// Đang nhấc người lên một bậc
+    pub stepping: bool,
 }
 
 impl Default for Character {
@@ -54,6 +78,12 @@ impl Default for Character {
             is_grounded: false,
             state: ActionState::Idle,
             attack_timer: 0.0,
+            attack_len: 0.35,
+            sprinting: false,
+            air_time: 0.0,
+            land_timer: 0.0,
+            climb_stamina: CLIMB_STAMINA,
+            stepping: false,
         }
     }
 }
@@ -91,6 +121,13 @@ impl Default for OrbitCamera {
 
 const GRAVITY: f32 = -26.0;
 const JUMP_FORCE: f32 = 11.0;
+const SPRINT_MULT: f32 = 1.65;
+const SWIM_MULT: f32 = 0.55;
+const CLIMB_SPEED: f32 = 3.6;
+const CLIMB_STAMINA: f32 = 3.5;
+const COYOTE_TIME: f32 = 0.12;
+/// Tốc độ nhấc người lên khi bước lên bậc (khối/giây), thay cho việc dịch chuyển tức thời
+const STEP_RATE: f32 = 6.0;
 
 pub fn character_controller(
     time: Res<Time>,
@@ -123,48 +160,116 @@ pub fn character_controller(
         if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
             move_input += right_flat;
         }
+        let moving = move_input != Vec3::ZERO;
+        let direction = move_input.normalize_or_zero();
 
-        // 1. Lấy độ cao mặt đất thực tế
+        // 1. Độ cao mặt đất thực tế + trạng thái nước
         let ground_y = if let Some(ref map) = voxel_map {
             map.get_walk_height(transform.translation.x, transform.translation.z, transform.translation.y).0
         } else {
             0.0
         };
+        let (in_water, head_in_water) = if let Some(ref map) = voxel_map {
+            let (x, y, z) = (transform.translation.x, transform.translation.y, transform.translation.z);
+            let w = |h: f32| map.block_at(x, y + h, z) == Some(redstoric_voxel::BlockType::Water);
+            (w(0.4), w(1.1))
+        } else {
+            (false, false)
+        };
 
-        // 2. Nhảy
-        if keyboard.just_pressed(KeyCode::Space) && character.is_grounded {
-            character.velocity_y = JUMP_FORCE;
-            character.is_grounded = false;
+        let was_grounded = character.is_grounded;
+        let sprint_key = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+        character.sprinting = sprint_key && moving && !in_water;
+        if character.land_timer > 0.0 {
+            character.land_timer -= dt;
         }
 
-        // 3. Trọng lực & Rơi tự do
-        character.velocity_y += GRAVITY * dt;
+        // 2. Nhảy (có "coyote time": vừa rời mép vẫn nhảy được) / bơi lên
+        if was_grounded {
+            character.air_time = 0.0;
+        } else {
+            character.air_time += dt;
+        }
+        let can_jump = character.is_grounded || (character.air_time < COYOTE_TIME && character.velocity_y <= 0.0);
+        if keyboard.just_pressed(KeyCode::Space) && can_jump && !in_water {
+            character.velocity_y = JUMP_FORCE;
+            character.is_grounded = false;
+            character.air_time = COYOTE_TIME;
+        }
+
+        // 3. Trọng lực / bơi
+        let mut climbing = false;
+        if in_water {
+            // Nổi: đẩy lên khi ngực còn chìm, kéo xuống khi Ctrl, Space bơi lên
+            let mut accel = if head_in_water { 14.0 } else { -6.0 };
+            if keyboard.pressed(KeyCode::Space) {
+                accel += 16.0;
+            }
+            if keyboard.pressed(KeyCode::ControlLeft) {
+                accel -= 22.0;
+            }
+            character.velocity_y += accel * dt;
+            character.velocity_y *= (1.0 - 4.0 * dt).max(0.0); // lực cản của nước
+            character.climb_stamina = CLIMB_STAMINA;
+        } else {
+            character.velocity_y += GRAVITY * dt;
+        }
         transform.translation.y += character.velocity_y * dt;
 
         // 4. Va chạm với mặt đất voxel
-        if transform.translation.y <= ground_y {
+        let gap = ground_y - transform.translation.y;
+        character.stepping = false;
+        if gap > 0.3 && gap <= 1.4 && character.velocity_y > -4.0 {
+            // Bước lên bậc: nhấc người lên mượt, không "tele"
+            character.stepping = true;
+            character.velocity_y = 0.0;
+            character.is_grounded = true;
+            transform.translation.y += (STEP_RATE * dt).min(gap);
+        } else if transform.translation.y <= ground_y {
+            let impact = -character.velocity_y;
             transform.translation.y = ground_y;
             character.velocity_y = 0.0;
             character.is_grounded = true;
+            if !was_grounded && impact > 9.0 && !in_water {
+                character.land_timer = 0.22;
+            }
         } else if transform.translation.y - ground_y > 0.2 {
             character.is_grounded = false;
         }
+        if character.is_grounded {
+            character.climb_stamina = (character.climb_stamina + dt * 2.0).min(CLIMB_STAMINA);
+        }
 
-        // 5. Di chuyển nhân vật theo hướng camera và Auto Step-up
-        if move_input != Vec3::ZERO {
-            let direction = move_input.normalize();
-            let next_x = transform.translation.x + direction.x * character.speed * dt;
-            let next_z = transform.translation.z + direction.z * character.speed * dt;
+        // 5. Di chuyển theo hướng camera, auto step-up, leo vách khi bị chặn
+        if moving {
+            let mut speed = character.speed;
+            if character.sprinting {
+                speed *= SPRINT_MULT;
+            }
+            if in_water {
+                speed *= SWIM_MULT;
+            }
+            let next_x = transform.translation.x + direction.x * speed * dt;
+            let next_z = transform.translation.z + direction.z * speed * dt;
 
             if let Some(ref map) = voxel_map {
                 let (next_ground, blocked) =
                     map.get_walk_height(next_x, next_z, transform.translation.y);
-                if !blocked && next_ground - transform.translation.y <= 1.25 {
+                let too_high = next_ground - transform.translation.y > 1.25;
+                if !blocked && !too_high {
                     transform.translation.x = next_x;
                     transform.translation.z = next_z;
-                    if next_ground > transform.translation.y {
+                    // Chênh cao nhỏ (xuống dốc nhẹ/lên mép) thì xử lý ở bước va chạm; bậc lớn được nhấc mượt
+                    if next_ground > transform.translation.y && next_ground - transform.translation.y <= 0.3 {
                         transform.translation.y = next_ground;
                     }
+                } else if !in_water && character.climb_stamina > 0.0 {
+                    // Bám vách và leo lên: không rơi, đi lên với tốc độ cố định
+                    climbing = true;
+                    character.velocity_y = 0.0;
+                    character.is_grounded = false;
+                    character.climb_stamina -= dt;
+                    transform.translation.y += CLIMB_SPEED * dt;
                 }
             } else {
                 transform.translation.x = next_x;
@@ -173,12 +278,40 @@ pub fn character_controller(
 
             let target_rotation = Quat::from_rotation_y((-direction.x).atan2(-direction.z));
             transform.rotation = transform.rotation.slerp(target_rotation, (15.0 * dt).min(1.0));
+        }
 
-            if character.attack_timer <= 0.0 {
-                character.state = ActionState::Running;
-            }
-        } else if character.attack_timer <= 0.0 {
-            character.state = ActionState::Idle;
+        // 6. Trạng thái hoạt ảnh (đòn đánh có ưu tiên riêng)
+        if character.attack_timer <= 0.0 {
+            character.state = if in_water {
+                ActionState::Swimming
+            } else if climbing {
+                ActionState::Climbing
+            } else if character.stepping || (!character.is_grounded && character.velocity_y > 0.5) {
+                ActionState::Jumping
+            } else if !character.is_grounded && character.air_time > 0.12 {
+                ActionState::Falling
+            } else if moving && character.sprinting {
+                ActionState::Sprinting
+            } else if moving {
+                ActionState::Running
+            } else {
+                ActionState::Idle
+            };
+        }
+    }
+}
+
+/// Mở rộng góc nhìn khi chạy nước rút để tạo cảm giác tốc độ.
+pub fn sprint_fov_system(
+    time: Res<Time>,
+    player: Query<&Character>,
+    mut cameras: Query<&mut Projection, With<OrbitCamera>>,
+) {
+    let Ok(character) = player.single() else { return; };
+    let target = if character.state == ActionState::Sprinting { 56.0_f32 } else { 45.0_f32 }.to_radians();
+    for mut proj in &mut cameras {
+        if let Projection::Perspective(p) = proj.as_mut() {
+            p.fov += (target - p.fov) * (6.0 * time.delta_secs()).min(1.0);
         }
     }
 }

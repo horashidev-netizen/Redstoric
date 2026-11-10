@@ -166,23 +166,82 @@ fn apply_shading(base: [f32; 4], face_light: f32, jitter: f32, ao: f32) -> [f32;
     ]
 }
 
-pub fn generate_chunk_mesh(chunk: &ChunkData) -> Option<Mesh> {
+
+/// Nhiễu giá trị 2D (value noise) mượt, theo toạ độ thế giới, trả về 0..1.
+fn value_noise(x: f32, z: f32, seed: u32) -> f32 {
+    fn h(ix: i32, iz: i32, seed: u32) -> f32 {
+        let mut v = (ix as u32).wrapping_mul(374761393)
+            ^ (iz as u32).wrapping_mul(668265263)
+            ^ seed.wrapping_mul(2246822519);
+        v = (v ^ (v >> 13)).wrapping_mul(1274126177);
+        v ^= v >> 16;
+        (v & 0xffff) as f32 / 65535.0
+    }
+    let (ix, iz) = (x.floor() as i32, z.floor() as i32);
+    let (fx, fz) = (x - ix as f32, z - iz as f32);
+    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+    let a = h(ix, iz, seed) + (h(ix + 1, iz, seed) - h(ix, iz, seed)) * sx;
+    let b = h(ix, iz + 1, seed) + (h(ix + 1, iz + 1, seed) - h(ix, iz + 1, seed)) * sx;
+    a + (b - a) * sz
+}
+
+/// Biến thiên màu theo vùng (tần số thấp): cỏ/lá chuyển giữa vàng-úa và xanh lam-đậm,
+/// cát/đất/đá sáng tối theo mảng lớn. Liên tục qua biên chunk vì dùng toạ độ thế giới.
+fn region_tint(block: BlockType, base: [f32; 4], wx: i32, wz: i32) -> [f32; 4] {
+    let (x, z) = (wx as f32, wz as f32);
+    let big = value_noise(x / 48.0, z / 48.0, 11) - 0.5;   // mảng lớn
+    let mid = value_noise(x / 14.0, z / 14.0, 23) - 0.5;   // mảng vừa
+    let n = big * 0.7 + mid * 0.3; // ~ -0.5..0.5
+    let [r, g, b, a] = base;
+    match block {
+        BlockType::Grass | BlockType::Leaves | BlockType::LeavesLight | BlockType::Rice => {
+            // n>0: ngả vàng/úa (thêm đỏ, bớt lam); n<0: xanh lục đậm lạnh
+            [
+                (r + n * 0.22).clamp(0.0, 1.0),
+                (g + n * 0.04 - n.abs() * 0.04).clamp(0.0, 1.0),
+                (b - n * 0.10).clamp(0.0, 1.0),
+                a,
+            ]
+        }
+        BlockType::PineLeaves => [r, (g + n * 0.06).clamp(0.0, 1.0), (b + n * 0.05).clamp(0.0, 1.0), a],
+        BlockType::Sand | BlockType::Dirt | BlockType::Farmland => {
+            let k = 1.0 + n * 0.30;
+            [(r * k).clamp(0.0, 1.0), (g * k).clamp(0.0, 1.0), (b * k * (1.0 - n * 0.1)).clamp(0.0, 1.0), a]
+        }
+        BlockType::Stone | BlockType::CliffStone | BlockType::Cobble => {
+            let k = 1.0 + n * 0.35;
+            [(r * k).clamp(0.0, 1.0), (g * k).clamp(0.0, 1.0), (b * k * (1.0 + n * 0.1)).clamp(0.0, 1.0), a]
+        }
+        BlockType::Snow => {
+            let k = 1.0 + n * 0.06;
+            [(r * k).clamp(0.0, 1.0), (g * k).clamp(0.0, 1.0), b, a]
+        }
+        _ => base,
+    }
+}
+
+pub fn generate_chunk_mesh(chunk: &ChunkData, cx: i32, cz: i32) -> Option<Mesh> {
     let mut builder = MeshBuilder::new();
 
     for x in 0..CHUNK_SIZE_X as i32 {
         for y in 0..CHUNK_SIZE_Y as i32 {
             for z in 0..CHUNK_SIZE_Z as i32 {
                 let current_block = chunk.blocks[x as usize][y as usize][z as usize];
-                if current_block == BlockType::Air {
+                // Nước dựng riêng (xem `generate_water_mesh`) để có vật liệu bóng, trong suốt
+                if current_block == BlockType::Air || current_block == BlockType::Water {
                     continue;
                 }
 
-                let base_color = get_block_base_color(current_block);
+                // Toạ độ thế giới: hash/nhiễu theo đó để không lặp lại giữa các chunk
+                let wx = cx * CHUNK_SIZE_X as i32 + x;
+                let wz = cz * CHUNK_SIZE_Z as i32 + z;
+                let base_color = region_tint(current_block, get_block_base_color(current_block), wx, wz);
 
                 // Tạo hạt màu (color jitter) ngẫu nhiên theo tọa độ khối để chống cảm giác bề mặt nhựa phẳng
-                let hash = ((x as u32).wrapping_mul(73856093))
+                let hash = ((wx as u32).wrapping_mul(73856093))
                     ^ ((y as u32).wrapping_mul(19349663))
-                    ^ ((z as u32).wrapping_mul(83492791));
+                    ^ ((wz as u32).wrapping_mul(83492791));
+                let hash = (hash ^ (hash >> 13)).wrapping_mul(0x5bd1e995);
                 let jitter_amp = match current_block {
                     BlockType::Leaves | BlockType::LeavesLight | BlockType::PineLeaves => 0.20, // lá: nhiều sắc độ
                     BlockType::Wood | BlockType::BirchWood => 0.10,
@@ -360,4 +419,90 @@ pub fn generate_chunk_mesh(chunk: &ChunkData) -> Option<Mesh> {
     }
 
     builder.build()
+}
+
+/// Mặt nước của một chunk: chỉ các mặt trên tiếp giáp không khí, nằm thấp hơn đỉnh khối một chút.
+/// UV theo toạ độ thế giới để normal map gợn sóng liền mạch giữa các chunk.
+/// Màu đỉnh mã hoá độ sâu: nước nông trong và xanh ngọc, càng sâu càng đục và xanh đậm,
+/// nên nhìn xuyên được xuống đáy ở chỗ nông và không nhìn thấy gì ở chỗ sâu.
+pub fn generate_water_mesh(chunk: &ChunkData, cx: i32, cz: i32) -> Option<Mesh> {
+    const N: usize = CHUNK_SIZE_X;
+    const UV_SCALE: f32 = 1.0 / 6.0;
+    let (ox, oz) = ((cx * CHUNK_SIZE_X as i32) as f32, (cz * CHUNK_SIZE_Z as i32) as f32);
+
+    // Mỗi cột: độ cao mặt nước và độ sâu (số khối nước liên tiếp bên dưới)
+    let mut top: Vec<(usize, usize, usize, f32)> = Vec::new();
+    let mut depth = [[0.0f32; N]; N];
+    for x in 0..N {
+        for z in 0..N {
+            for y in 0..CHUNK_SIZE_Y {
+                if chunk.blocks[x][y][z] != BlockType::Water {
+                    continue;
+                }
+                if y + 1 < CHUNK_SIZE_Y && chunk.blocks[x][y + 1][z] != BlockType::Air {
+                    continue;
+                }
+                let mut d = 0usize;
+                while d <= y && chunk.blocks[x][y - d][z] == BlockType::Water {
+                    d += 1;
+                }
+                depth[x][z] = d as f32;
+                top.push((x, y, z, d as f32));
+            }
+        }
+    }
+    if top.is_empty() {
+        return None;
+    }
+
+    // Độ sâu tại đỉnh = trung bình 4 ô quanh đỉnh (ô không phải nước tính 0) nên bờ nước trong dần
+    let vertex_depth = |vx: usize, vz: usize| -> f32 {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for (dx, dz) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            if vx + dx >= 1 && vz + dz >= 1 && vx + dx - 1 < N && vz + dz - 1 < N {
+                sum += depth[vx + dx - 1][vz + dz - 1];
+                n += 1.0;
+            }
+        }
+        if n > 0.0 { sum / n } else { 0.0 }
+    };
+    let color_for = |d: f32| -> [f32; 4] {
+        let t = (d / 9.0).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t);
+        let shallow = [0.42, 0.80, 0.82];
+        let deep = [0.015, 0.10, 0.26];
+        let a = 0.16 + 0.80 * t;
+        [
+            shallow[0] + (deep[0] - shallow[0]) * t,
+            shallow[1] + (deep[1] - shallow[1]) * t,
+            shallow[2] + (deep[2] - shallow[2]) * t,
+            a,
+        ]
+    };
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for (x, y, z, _) in top {
+        let fy = y as f32 + 0.9;
+        let base = positions.len() as u32;
+        for (dx, dz) in [(0usize, 0usize), (0, 1), (1, 1), (1, 0)] {
+            let (px, pz) = ((x + dx) as f32, (z + dz) as f32);
+            positions.push([px, fy, pz]);
+            uvs.push([(ox + px) * UV_SCALE, (oz + pz) * UV_SCALE]);
+            colors.push(color_for(vertex_depth(x + dx, z + dz)));
+        }
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    let n = positions.len();
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; n]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0, 0.0, 0.0, 1.0]; n]);
+    mesh.insert_indices(Indices::U32(indices));
+    Some(mesh)
 }

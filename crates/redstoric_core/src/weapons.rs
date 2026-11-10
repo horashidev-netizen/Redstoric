@@ -1,0 +1,141 @@
+//! Vũ khí theo chức nghiệp (lấy bộ vũ khí khởi đầu của Veloren).
+//! Mỗi người chơi chọn MỘT chức nghiệp (menu nhân vật, lần đầu vào game), vũ khí theo chức nghiệp đó. Chỉ số và cách đánh nằm trong
+//! `redstoric_combat_ai` (kiếm/rìu/búa cận chiến, cung bắn tên, trượng lửa, quyền trượng chữa lành).
+//!
+//! Vị trí cầm: tâm model (glb được căn giữa theo bounds) = offset trong `biped_weapon_manifest.ron`
+//! của Veloren + nửa kích thước, đổi trục (x, y_trước, z_lên) -> Bevy (x, z, -y). Model gắn vào
+//! một nút "pivot" đặt ngay tại bàn tay, nên xoay pivot là xoay quanh chỗ cầm.
+use bevy::prelude::*;
+
+use crate::biped::BoneHandRight;
+use crate::WeaponHand;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WeaponKind {
+    Sword,
+    Axe,
+    Hammer,
+    Bow,
+    FireStaff,
+    Sceptre,
+}
+
+pub struct WeaponDef {
+    pub kind: WeaponKind,
+    /// Tên chức nghiệp hiển thị
+    pub class: &'static str,
+    pub name: &'static str,
+    /// Đường dẫn dưới `assets/placeholders/glb/weapon/`
+    pub glb: &'static str,
+    /// Tâm model so với bàn tay (đơn vị voxel của model nhân vật)
+    pub center: (f32, f32, f32),
+    /// Độ nghiêng của vũ khí khi nghỉ (rad)
+    pub rest_pitch: f32,
+    /// Thời gian một đòn (giây)
+    pub duration: f32,
+    /// Thời điểm (0..1) đòn trúng / đạn rời tay
+    pub release: f32,
+    pub damage: f32,
+    /// Tầm đánh cận chiến, hoặc tầm bay tối đa của đạn
+    pub range: f32,
+    /// Màu nhãn trên thanh vũ khí
+    pub color: (f32, f32, f32),
+}
+
+pub const WEAPONS: [WeaponDef; 6] = [
+    WeaponDef {
+        kind: WeaponKind::Sword, class: "Kiếm sĩ", name: "Kiếm khởi đầu",
+        glb: "sword/starter.glb", center: (-1.0, 13.5, 0.0), rest_pitch: -0.35,
+        duration: 0.35, release: 0.40, damage: 25.0, range: 3.0, color: (0.55, 0.75, 0.95),
+    },
+    WeaponDef {
+        kind: WeaponKind::Axe, class: "Chiến binh rìu", name: "Rìu cùn",
+        glb: "axe/2haxe_rusty.glb", center: (-1.0, 9.0, 0.0), rest_pitch: -0.35,
+        duration: 0.60, release: 0.45, damage: 22.0, range: 3.3, color: (0.85, 0.60, 0.35),
+    },
+    WeaponDef {
+        kind: WeaponKind::Hammer, class: "Chiến binh búa", name: "Búa nặng cũ",
+        glb: "hammer/2hhammer_rusty.glb", center: (0.0, 9.0, 0.0), rest_pitch: -0.30,
+        duration: 0.85, release: 0.58, damage: 45.0, range: 3.8, color: (0.65, 0.70, 0.85),
+    },
+    WeaponDef {
+        kind: WeaponKind::Bow, class: "Cung thủ", name: "Cung khởi đầu",
+        glb: "bow/starter.glb", center: (0.0, 0.0, 0.0), rest_pitch: 0.0,
+        duration: 0.60, release: 0.45, damage: 24.0, range: 55.0, color: (0.80, 0.65, 0.35),
+    },
+    WeaponDef {
+        kind: WeaponKind::FireStaff, class: "Pháp sư lửa", name: "Trượng lửa",
+        glb: "staff/firestaff_starter.glb", center: (-1.0, 10.5, 0.0), rest_pitch: -0.10,
+        duration: 0.75, release: 0.50, damage: 32.0, range: 45.0, color: (1.00, 0.45, 0.20),
+    },
+    WeaponDef {
+        kind: WeaponKind::Sceptre, class: "Mục sư", name: "Quyền trượng",
+        glb: "sceptre/wood-simple.glb", center: (-2.0, 10.0, 0.0), rest_pitch: -0.10,
+        duration: 0.50, release: 0.40, damage: 14.0, range: 40.0, color: (0.45, 0.85, 0.40),
+    },
+];
+
+#[derive(Resource, Default)]
+pub struct Loadout {
+    pub selected: usize,
+}
+
+impl Loadout {
+    pub fn current(&self) -> &'static WeaponDef {
+        &WEAPONS[self.selected.min(WEAPONS.len() - 1)]
+    }
+}
+
+/// Tên chức nghiệp không dấu (font mặc định không có chữ tiếng Việt), cùng thứ tự `WEAPONS`.
+pub const CLASS_LABELS: [&str; 6] = ["Kiem si", "Chien binh rieu", "Chien binh bua", "Cung thu", "Phap su lua", "Muc su"];
+
+pub struct WeaponPlugin;
+
+impl Plugin for WeaponPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Loadout>().add_systems(Update, (sync_loadout_system, weapon_equip_system).chain());
+    }
+}
+
+/// Mỗi người chơi chỉ có một chức nghiệp (chọn trong menu nhân vật), vũ khí theo chức nghiệp đó.
+fn sync_loadout_system(appearance: Res<crate::character_creator::CharacterAppearance>, mut loadout: ResMut<Loadout>) {
+    if appearance.is_changed() {
+        let i = appearance.class.min(WEAPONS.len() - 1);
+        if loadout.selected != i {
+            loadout.selected = i;
+        }
+    }
+}
+
+/// Gắn model vũ khí đang chọn vào bàn tay phải (cả khi nhân vật được dựng lại).
+fn weapon_equip_system(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    loadout: Res<Loadout>,
+    new_hands: Query<(), Added<BoneHandRight>>,
+    hands: Query<(Entity, Option<&Children>), With<BoneHandRight>>,
+    weapons: Query<(), With<WeaponHand>>,
+) {
+    if !loadout.is_changed() && new_hands.is_empty() {
+        return;
+    }
+    let def = loadout.current();
+    for (hand, children) in &hands {
+        if let Some(children) = children {
+            for c in children.iter().map(|c| c.clone()) {
+                if weapons.contains(c) {
+                    commands.entity(c).try_despawn();
+                }
+            }
+        }
+        let scene = assets.load(GltfAssetLabel::Scene(0).from_asset(format!("placeholders/glb/weapon/{}", def.glb)));
+        let (cx, cy, cz) = def.center;
+        let pitch = def.rest_pitch;
+        commands.entity(hand).with_children(|h| {
+            h.spawn((Transform::from_rotation(Quat::from_rotation_x(pitch)), Visibility::default(), WeaponHand))
+                .with_children(|pivot| {
+                    pivot.spawn((WorldAssetRoot(scene), Transform::from_xyz(cx, cy, cz)));
+                });
+        });
+    }
+}

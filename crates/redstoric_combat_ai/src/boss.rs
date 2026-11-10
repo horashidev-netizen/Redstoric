@@ -12,15 +12,17 @@ use redstoric_voxel::{BossSpawnPoint, VoxelWorldMap};
 
 use crate::types::{Health, HitFlash, Knockback};
 
-const BOSS_HEALTH: f32 = 500.0;
-const AGGRO_RANGE: f32 = 22.0;
-const LEASH_RANGE: f32 = 50.0;
-const SPEED: f32 = 3.6;
-const ATTACK_RANGE: f32 = 3.2;
-const ATTACK_DAMAGE: f32 = 20.0;
-const WINDUP: f32 = 0.7;
-const RECOVER: f32 = 1.1;
-pub const DEATH_TIME: f32 = 2.5;
+// Số liệu cân bằng lấy từ `redstoric_common::rules` để khớp với server.
+use redstoric_common::rules::boss as rules;
+const BOSS_HEALTH: f32 = rules::HEALTH;
+const AGGRO_RANGE: f32 = rules::AGGRO_RANGE;
+const LEASH_RANGE: f32 = rules::LEASH_RANGE;
+const SPEED: f32 = rules::SPEED;
+const ATTACK_RANGE: f32 = rules::ATTACK_RANGE;
+const ATTACK_DAMAGE: f32 = rules::ATTACK_DAMAGE;
+const WINDUP: f32 = rules::WINDUP;
+const RECOVER: f32 = rules::RECOVER;
+pub const DEATH_TIME: f32 = rules::DEATH_TIME;
 
 const BODY_COLOR: Color = Color::srgb(0.30, 0.10, 0.12);
 const WINDUP_COLOR: Color = Color::srgb(0.95, 0.45, 0.10);

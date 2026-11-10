@@ -1,26 +1,23 @@
-pub mod block;
-pub mod chunk;
-pub mod generation;
+//! Phần voxel dành cho **client**: bản đồ chunk, dựng mesh, streaming và spawn prop.
+//! Dữ liệu thuần (khối, chunk, sinh thế giới, cấu trúc) nằm ở `redstoric_common`
+//! và được re-export tại đây để đường dẫn cũ vẫn dùng được.
+
 pub mod map;
 pub mod meshing;
-pub mod systems;
-pub mod worldgen;
+pub mod preload;
 pub mod prop;
-pub mod sprites;
-pub mod structures;
-pub use prop::{BossSpawnPoint, WorldProp, WorldPropKind, PropSpawnData};
+pub mod systems;
 
-pub use block::BlockType;
-pub use chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
-pub use generation::WorldGenerator;
+pub use redstoric_common::{block, chunk, generation, sprites, structures, worldgen};
+pub use redstoric_common::{BlockType, ChunkData, WorldGenerator, WORLD_SEED};
+pub use redstoric_common::{CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
+pub use prop::{BossSpawnPoint, PropSpawnData, VillagerSpawn, WorldProp, WorldPropKind};
 pub use map::VoxelWorldMap;
-pub use systems::{VoxelStreamSettings, VoxelViewer};
+pub use systems::{VoxelStreamSettings, VoxelViewer, WaterMaterial};
 
 use bevy::prelude::*;
-use systems::{chunk_streaming_system, handle_chunk_tasks, setup_voxel_world, spawn_chunk_props};
-
-/// Hạt giống thế giới. Server và mọi client phải dùng cùng giá trị để chunk sinh giống nhau.
-pub const WORLD_SEED: u32 = 1337;
+use preload::{poll_preload, start_preload, update_loading_screen, world_ready, PreloadedProps};
+use systems::{chunk_streaming_system, clamp_viewer_to_world, handle_chunk_tasks, setup_voxel_world, spawn_chunk_props};
 
 pub struct VoxelWorldPlugin;
 
@@ -29,7 +26,15 @@ impl Plugin for VoxelWorldPlugin {
         app.init_resource::<VoxelWorldMap>()
             .init_resource::<VoxelStreamSettings>()
             .insert_resource(WorldGenerator::new(WORLD_SEED))
-            .add_systems(Startup, setup_voxel_world)
-            .add_systems(Update, (chunk_streaming_system, handle_chunk_tasks, spawn_chunk_props));
+            .init_resource::<PreloadedProps>()
+            .add_systems(Startup, (setup_voxel_world, start_preload))
+            .add_systems(Update, (poll_preload, update_loading_screen).chain().run_if(resource_exists::<preload::WorldPreload>))
+            .add_systems(
+                Update,
+                (chunk_streaming_system, handle_chunk_tasks, spawn_chunk_props)
+                    .run_if(world_ready)
+                    .run_if(resource_exists::<preload::WorldPreload>),
+            )
+            .add_systems(Update, clamp_viewer_to_world);
     }
 }

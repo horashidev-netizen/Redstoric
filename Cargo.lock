@@ -9,6 +9,7 @@ dependencies = [
  "bevy",
  "dot_vox",
  "redstoric_combat_ai",
+ "redstoric_common",
  "redstoric_core",
  "redstoric_net",
  "redstoric_voxel",
@@ -1160,6 +1161,7 @@ dependencies = [
  "bevy_pbr",
  "bevy_picking",
  "bevy_platform",
+ "bevy_post_process",
  "bevy_ptr",
  "bevy_reflect",
  "bevy_render",
@@ -1413,6 +1415,33 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-time",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bevy_post_process"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16a897d6318ed562de228d026b4c4f384c7430fff027c2b4d35367bdad0151ec"
+dependencies = [
+ "bevy_app",
+ "bevy_asset",
+ "bevy_camera",
+ "bevy_color",
+ "bevy_core_pipeline",
+ "bevy_curve",
+ "bevy_derive",
+ "bevy_ecs",
+ "bevy_extract",
+ "bevy_image",
+ "bevy_math",
+ "bevy_platform",
+ "bevy_reflect",
+ "bevy_render",
+ "bevy_shader",
+ "bevy_utils",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -3528,6 +3557,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "lewton"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777b48df9aaab155475a83a7df3070395ea1ac6902f5cd062b8f2b028075c030"
+dependencies = [
+ "byteorder",
+ "ogg",
+ "tinyvec",
+]
+
+[[package]]
 name = "lexical"
 version = "7.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4381,6 +4421,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ogg"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6951b4e8bf21c8193da321bcce9c9dd2e13c858fe078bf9054a288b419ae5d6e"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4927,8 +4976,19 @@ name = "redstoric_combat_ai"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "redstoric_common",
  "redstoric_core",
  "redstoric_voxel",
+]
+
+[[package]]
+name = "redstoric_common"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+ "bevy_math",
+ "noise",
+ "serde_json",
 ]
 
 [[package]]
@@ -4936,6 +4996,7 @@ name = "redstoric_core"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "redstoric_common",
  "redstoric_voxel",
  "serde",
  "serde_json",
@@ -4948,6 +5009,7 @@ dependencies = [
  "bevy",
  "bevy_quinnet",
  "redstoric_combat_ai",
+ "redstoric_common",
  "redstoric_core",
  "redstoric_voxel",
  "serde",
@@ -4959,8 +5021,7 @@ name = "redstoric_voxel"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "noise",
- "serde_json",
+ "redstoric_common",
 ]
 
 [[package]]
@@ -5008,6 +5069,7 @@ checksum = "d0a536bb79db59098ef71a4dd4246c02eb87b316deceb1b68e0cde7167ec01eb"
 dependencies = [
  "cpal",
  "dasp_sample",
+ "lewton",
  "num-rational",
  "thiserror 2.0.21",
  "tracing",
