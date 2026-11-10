@@ -20,6 +20,8 @@ project_dump.md
 *.swo
 *~
 *.tmp
+_backup*
+*.tar.gz
 
 # ── Bí mật / chứng chỉ / khoá (KHÔNG BAO GIỜ commit) ──
 server_cert.pem

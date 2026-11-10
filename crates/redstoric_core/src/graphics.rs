@@ -12,6 +12,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap};
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
 use redstoric_voxel::{VoxelStreamSettings, CHUNK_SIZE_X};
+use redstoric_common::paths::data_path;
 use serde::{Deserialize, Serialize};
 
 const SETTINGS_PATH: &str = "graphics_settings.json";
@@ -144,7 +145,9 @@ pub struct GraphicsSettings {
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
-        Self { mode: QualityMode::Auto, target_fps: 60.0 }
+        // Điện thoại: mặc định mức Low cố định (GPU di động yếu, Auto có thể nâng lên quá tay)
+        let mode = if cfg!(target_os = "android") { QualityMode::Fixed(Quality::Low) } else { QualityMode::Auto };
+        Self { mode, target_fps: 60.0 }
     }
 }
 
@@ -171,7 +174,7 @@ pub(crate) struct AutoTuner {
 struct QualityLabel;
 
 fn load_settings() -> GraphicsSettings {
-    std::fs::read_to_string(SETTINGS_PATH)
+    std::fs::read_to_string(data_path(SETTINGS_PATH))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
@@ -179,7 +182,7 @@ fn load_settings() -> GraphicsSettings {
 
 pub(crate) fn save_settings(settings: &GraphicsSettings) {
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(SETTINGS_PATH, json);
+        let _ = std::fs::write(data_path(SETTINGS_PATH), json);
     }
 }
 

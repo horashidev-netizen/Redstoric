@@ -1,0 +1,435 @@
+//! Âm thanh: nhạc nền theo giờ/thời tiết, tiếng nền (gió, mưa, suối, chim, dế, sấm),
+//! bước chân theo loại khối, nhảy/đáp/bơi, đòn đánh, tiếng kêu của thú.
+//! Dùng bộ âm thanh của Veloren trong `assets/placeholders/voxygen/audio`.
+//! Âm lượng theo khoảng cách tính tay (không dùng spatial audio) cho đơn giản.
+//! F10 tắt/bật toàn bộ tiếng.
+use std::collections::HashMap;
+
+use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings, Volume};
+use bevy::prelude::*;
+use redstoric_combat_ai::fauna::{Agent, Animal, Mood};
+use redstoric_combat_ai::Health;
+use redstoric_common::fauna::Species;
+use redstoric_core::daynight::TimeOfDay;
+use redstoric_core::weather::Weather;
+use redstoric_core::{ActionState, Character};
+use redstoric_voxel::preload::world_ready;
+use redstoric_voxel::{BlockType, VoxelWorldMap};
+
+const BASE: &str = "placeholders/voxygen/audio/";
+const HEAR_ANIMAL: f32 = 38.0;
+const SEA_Y: f32 = 16.0;
+
+const MUSIC_DAY: &[&str] = &[
+    "calming_hills", "serene_meadows", "verdant_glades", "soaring_skies", "adventurous_soul",
+    "field_grazing", "true_nature", "just_the_beginning", "graceful_journey", "a_peaceful_moment",
+    "between_the_fairies",
+];
+const MUSIC_NIGHT: &[&str] = &["moonbeams", "stargazing", "travel_by_night", "moonlit_canopy", "desert_at_night"];
+const MUSIC_RAIN: &[&str] = &["the_heavens_weep", "drifting_along", "a_cold_breeze_blows"];
+
+pub struct GameAudioPlugin;
+
+impl Plugin for GameAudioPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Mix>().init_resource::<AudioRng>().add_systems(Startup, spawn_loops).add_systems(
+            Update,
+            (
+                toggle_mute,
+                loop_volumes,
+                music_system,
+                random_ambience,
+                player_sounds,
+                hit_sounds,
+                animal_sounds,
+            )
+                .run_if(world_ready),
+        );
+    }
+}
+
+#[derive(Resource)]
+struct Mix {
+    master: f32,
+    water_near: f32,
+    water_timer: f32,
+}
+impl Default for Mix {
+    fn default() -> Self {
+        Self { master: 1.0, water_near: 0.0, water_timer: 0.0 }
+    }
+}
+
+#[derive(Resource)]
+struct AudioRng(u32);
+impl Default for AudioRng {
+    fn default() -> Self {
+        Self(0x9E37_79B9)
+    }
+}
+impl AudioRng {
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (self.0 >> 8) as f32 / 16_777_216.0
+    }
+    fn range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.next()
+    }
+    fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
+        &v[((self.next() * v.len() as f32) as usize).min(v.len() - 1)]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LoopKind {
+    Wind,
+    Rain,
+    River,
+}
+
+#[derive(Component)]
+struct AmbientLoop(LoopKind);
+
+#[derive(Component)]
+struct Music;
+
+fn play(commands: &mut Commands, assets: &AssetServer, rel: &str, vol: f32) {
+    if vol < 0.01 {
+        return;
+    }
+    let handle: Handle<AudioSource> = assets.load(format!("{BASE}{rel}.ogg"));
+    commands.spawn((AudioPlayer::<AudioSource>(handle), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(vol))));
+}
+
+fn spawn_loops(mut commands: Commands, assets: Res<AssetServer>) {
+    for (kind, path) in [
+        (LoopKind::Wind, "ambience/wind"),
+        (LoopKind::Rain, "ambience/rain"),
+        (LoopKind::River, "ambience/river_quiet"),
+    ] {
+        let handle: Handle<AudioSource> = assets.load(format!("{BASE}{path}.ogg"));
+        commands.spawn((
+            AudioPlayer::<AudioSource>(handle),
+            PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+            AmbientLoop(kind),
+        ));
+    }
+}
+
+fn toggle_mute(keys: Res<ButtonInput<KeyCode>>, mut mix: ResMut<Mix>) {
+    if keys.just_pressed(KeyCode::F10) {
+        mix.master = if mix.master > 0.0 { 0.0 } else { 1.0 };
+    }
+}
+
+fn player_pos(q: &Query<(&Transform, &Character)>) -> Option<Vec3> {
+    q.iter().next().map(|(t, _)| t.translation)
+}
+
+/// Gió, mưa, suối: âm lượng đặt theo thời tiết và khoảng cách tới mặt nước.
+fn loop_volumes(
+    time: Res<Time>,
+    weather: Res<Weather>,
+    mut mix: ResMut<Mix>,
+    map: Option<Res<VoxelWorldMap>>,
+    players: Query<(&Transform, &Character)>,
+    mut loops: Query<(&AmbientLoop, &mut AudioSink)>,
+    mut musics: Query<&mut AudioSink, (With<Music>, Without<AmbientLoop>)>,
+) {
+    // Dò nước quanh người chơi mỗi 0.5 s (vòng tròn nhiều bán kính)
+    mix.water_timer -= time.delta_secs();
+    if mix.water_timer <= 0.0 {
+        mix.water_timer = 0.5;
+        let mut best = f32::MAX;
+        if let (Some(p), Some(map)) = (player_pos(&players), map.as_ref()) {
+            'outer: for r in [3.0f32, 6.0, 10.0, 15.0, 20.0] {
+                for i in 0..10 {
+                    let a = i as f32 * std::f32::consts::TAU / 10.0;
+                    let (x, z) = (p.x + a.cos() * r, p.z + a.sin() * r);
+                    if map.block_at(x, SEA_Y, z) == Some(BlockType::Water) {
+                        best = r;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        mix.water_near = if best == f32::MAX { 0.0 } else { (1.0 - best / 24.0).clamp(0.0, 1.0) };
+    }
+    let m = mix.master;
+    for (l, mut sink) in &mut loops {
+        let v = match l.0 {
+            LoopKind::Wind => 0.10 + 0.18 * weather.rain,
+            LoopKind::Rain => 0.55 * weather.rain,
+            LoopKind::River => 0.65 * mix.water_near * mix.water_near,
+        };
+        sink.set_volume(Volume::Linear(v * m));
+    }
+    for mut sink in &mut musics {
+        // nhạc nhỏ đi khi mưa to
+        sink.set_volume(Volume::Linear(0.32 * (1.0 - 0.4 * weather.rain) * m));
+    }
+}
+
+/// Nhạc nền: phát từng bài, nghỉ 40–100 s giữa các bài; bài chọn theo giờ/mưa.
+fn music_system(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    tod: Res<TimeOfDay>,
+    weather: Res<Weather>,
+    mut rng: ResMut<AudioRng>,
+    mix: Res<Mix>,
+    playing: Query<(), With<Music>>,
+    mut wait: Local<Option<f32>>,
+    mut started_once: Local<bool>,
+) {
+    if !playing.is_empty() {
+        return;
+    }
+    if wait.is_none() {
+        // Lần đầu chờ ngắn; sau mỗi bài nghỉ dài
+        *wait = Some(if *started_once { rng.range(40.0, 100.0) } else { rng.range(3.0, 10.0) });
+    }
+    let left = wait.unwrap_or(0.0) - time.delta_secs();
+    *wait = Some(left);
+    if left > 0.0 {
+        return;
+    }
+    *wait = None;
+    *started_once = true;
+    let day = tod.hour > 5.5 && tod.hour < 18.5;
+    let pool = if weather.rain > 0.5 {
+        MUSIC_RAIN
+    } else if day {
+        MUSIC_DAY
+    } else {
+        MUSIC_NIGHT
+    };
+    let name = *rng.pick(pool);
+    let handle: Handle<AudioSource> = assets.load(format!("{BASE}soundtrack/overworld/{name}.ogg"));
+    commands.spawn((
+        AudioPlayer::<AudioSource>(handle),
+        PlaybackSettings::DESPAWN.with_volume(Volume::Linear(0.32 * mix.master)),
+        Music,
+    ));
+}
+
+/// Chim ban ngày, dế/cú/ếch ban đêm, sấm khi mưa to.
+fn random_ambience(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    tod: Res<TimeOfDay>,
+    weather: Res<Weather>,
+    mix: Res<Mix>,
+    mut rng: ResMut<AudioRng>,
+    mut timers: Local<[f32; 3]>,
+) {
+    let dt = time.delta_secs();
+    for t in timers.iter_mut() {
+        *t -= dt;
+    }
+    let m = mix.master;
+    let day = tod.hour > 6.0 && tod.hour < 18.0;
+    // 0: chim / dế
+    if timers[0] <= 0.0 {
+        timers[0] = rng.range(6.0, 18.0);
+        if day && weather.rain < 0.3 {
+            let n = 1 + (rng.next() * 10.0) as u32 % 10;
+            play(&mut commands, &assets, &format!("sfx/ambient/birdcall_{n:02}"), 0.30 * m);
+        } else if !day {
+            let n = 1 + (rng.next() * 3.0) as u32 % 3;
+            play(&mut commands, &assets, &format!("sfx/ambient/crickets_{n}"), 0.30 * (1.0 - weather.rain) * m);
+        }
+    }
+    // 1: cú, ếch (đêm, gần nước thì ếch)
+    if timers[1] <= 0.0 {
+        timers[1] = rng.range(25.0, 70.0);
+        if !day && weather.rain < 0.5 {
+            if mix.water_near > 0.15 {
+                play(&mut commands, &assets, "sfx/ambient/frog_croak_1", 0.35 * m);
+            } else {
+                play(&mut commands, &assets, "sfx/ambient/owl_1", 0.25 * m);
+            }
+        }
+    }
+    // 2: sấm
+    if timers[2] <= 0.0 {
+        timers[2] = rng.range(18.0, 50.0);
+        if weather.rain > 0.7 {
+            play(&mut commands, &assets, "ambience/thunder", 0.55 * m);
+        }
+    }
+}
+
+fn step_sound(block: BlockType, rng: &mut AudioRng) -> String {
+    let (name, n) = match block {
+        BlockType::Grass | BlockType::Leaves | BlockType::LeavesLight | BlockType::PineLeaves
+        | BlockType::Wheat | BlockType::Rice => ("stepgrass_", 6),
+        BlockType::Dirt | BlockType::Sand | BlockType::Farmland => ("stepdirt_", 5),
+        BlockType::Snow => ("snow_step_", 3),
+        BlockType::Wood | BlockType::BirchWood | BlockType::Planks | BlockType::Bed => ("wood_step_", 4),
+        _ => ("stone_step_", 12),
+    };
+    let i = 1 + (rng.next() * n as f32) as u32 % n as u32;
+    format!("sfx/footsteps/{name}{i}")
+}
+
+/// Bước chân, nhảy, đáp đất, lội/bơi, vung đòn của người chơi.
+fn player_sounds(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    mix: Res<Mix>,
+    map: Option<Res<VoxelWorldMap>>,
+    mut rng: ResMut<AudioRng>,
+    players: Query<(&Transform, &Character)>,
+    mut step_t: Local<f32>,
+    mut prev: Local<(ActionState, f32, f32)>, // (state, land_timer, attack_timer)
+) {
+    let Some((tf, ch)) = players.iter().next() else { return };
+    let Some(map) = map else { return };
+    let m = mix.master;
+    let p = tf.translation;
+    let (prev_state, prev_land, prev_atk) = *prev;
+    *prev = (ch.state, ch.land_timer, ch.attack_timer);
+
+    // Khối dưới chân: dò xuống từ ngang hông
+    let below = || {
+        (0..4).find_map(|i| {
+            let b = map.block_at(p.x, p.y + 0.3 - i as f32 * 0.6, p.z)?;
+            (b != BlockType::Air).then_some(b)
+        })
+    };
+
+    match ch.state {
+        ActionState::Running | ActionState::Sprinting => {
+            *step_t -= time.delta_secs();
+            if *step_t <= 0.0 {
+                *step_t = if ch.state == ActionState::Sprinting { 0.30 } else { 0.44 };
+                if let Some(b) = below() {
+                    let in_water = b == BlockType::Water;
+                    let s = if in_water {
+                        format!("sfx/footsteps/water_splash_{}", 1 + (rng.next() * 4.0) as u32 % 4)
+                    } else {
+                        step_sound(b, &mut rng)
+                    };
+                    play(&mut commands, &assets, &s, 0.45 * m);
+                }
+            }
+        }
+        ActionState::Swimming => {
+            *step_t -= time.delta_secs();
+            if *step_t <= 0.0 {
+                *step_t = 0.7;
+                play(&mut commands, &assets, &format!("sfx/footsteps/water_splash_{}", 1 + (rng.next() * 4.0) as u32 % 4), 0.28 * m);
+            }
+        }
+        _ => *step_t = 0.0,
+    }
+
+    // Nhảy
+    if ch.state == ActionState::Jumping && prev_state != ActionState::Jumping {
+        play(&mut commands, &assets, &format!("sfx/character/catch_air_{}", 1 + (rng.next() * 8.0) as u32 % 8), 0.25 * m);
+    }
+    // Đáp đất (tư thế nhún bắt đầu)
+    if ch.land_timer > prev_land + 0.001 && prev_land <= 0.001 {
+        if let Some(b) = below() {
+            play(&mut commands, &assets, &step_sound(b, &mut rng), 0.6 * m);
+        }
+    }
+    // Rơi xuống nước / bắt đầu bơi
+    if ch.state == ActionState::Swimming && prev_state != ActionState::Swimming {
+        let big = if prev_state == ActionState::Falling { "splash_big" } else { "splash_medium" };
+        play(&mut commands, &assets, &format!("sfx/footsteps/{big}"), 0.55 * m);
+    }
+    // Vung đòn
+    if ch.attack_timer > prev_atk + 0.001 && prev_atk <= 0.001 {
+        play(&mut commands, &assets, "sfx/weapon/weapon_out", 0.4 * m);
+    }
+}
+
+/// Tiếng trúng đòn / tiếng kêu đau khi máu của thực thể giảm (trong tầm nghe).
+fn hit_sounds(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mix: Res<Mix>,
+    mut rng: ResMut<AudioRng>,
+    players: Query<(&Transform, &Character)>,
+    healths: Query<(Entity, &Transform, &Health, Option<&Animal>), Changed<Health>>,
+    mut last: Local<HashMap<Entity, f32>>,
+) {
+    let Some(pp) = player_pos(&players) else { return };
+    for (e, tf, hp, animal) in &healths {
+        let prev = last.insert(e, hp.current).unwrap_or(hp.current);
+        if hp.current >= prev {
+            continue;
+        }
+        let d = tf.translation.distance(pp);
+        let vol = 0.55 * (1.0 - d / 45.0).clamp(0.0, 1.0) * mix.master;
+        play(&mut commands, &assets, &format!("sfx/character/hit_{}", 1 + (rng.next() * 4.0) as u32 % 4), vol);
+        if let Some(a) = animal {
+            let cry = match a.species {
+                Species::Wolf => Some(format!("sfx/utterance/wolf_hurt{}", 1 + (rng.next() * 5.0) as u32 % 5)),
+                Species::Deer => Some("sfx/utterance/antelope_hurt1".to_string()),
+                Species::Pig => Some(format!("sfx/utterance/pig_angry{}", 1 + (rng.next() * 2.0) as u32 % 2)),
+                Species::Rabbit => None,
+            };
+            if let Some(c) = cry {
+                play(&mut commands, &assets, &c, vol * 0.9);
+            }
+        }
+    }
+    if last.len() > 600 {
+        last.clear();
+    }
+}
+
+/// Tiếng thú: gầm khi đuổi, kêu khi bỏ chạy, ủn ỉn/ngáp ngẫu nhiên khi thong thả.
+fn animal_sounds(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    mix: Res<Mix>,
+    mut rng: ResMut<AudioRng>,
+    players: Query<(&Transform, &Character)>,
+    animals: Query<(Entity, &Transform, &Animal, &Agent)>,
+    mut prev: Local<HashMap<Entity, Mood>>,
+) {
+    let Some(pp) = player_pos(&players) else { return };
+    let dt = time.delta_secs();
+    for (e, tf, animal, agent) in &animals {
+        let d = tf.translation.distance(pp);
+        let was = prev.insert(e, agent.mood);
+        if d > HEAR_ANIMAL {
+            continue;
+        }
+        let vol = (1.0 - d / HEAR_ANIMAL).powi(2) * mix.master;
+        let changed = was != Some(agent.mood);
+        let name: Option<String> = if changed {
+            match (animal.species, agent.mood) {
+                (Species::Wolf, Mood::Chase) | (Species::Wolf, Mood::Windup) => {
+                    Some(format!("sfx/utterance/wolf_angry{}", 1 + (rng.next() * 6.0) as u32 % 6))
+                }
+                (Species::Pig, Mood::Flee) => Some(format!("sfx/utterance/pig_angry{}", 1 + (rng.next() * 2.0) as u32 % 2)),
+                (Species::Deer, Mood::Flee) => Some("sfx/utterance/antelope_angry1".to_string()),
+                _ => None,
+            }
+        } else if matches!(agent.mood, Mood::Idle | Mood::Graze) && rng.next() < 0.035 * dt {
+            match animal.species {
+                Species::Pig => Some(format!("sfx/utterance/pig_calm{}", 1 + (rng.next() * 3.0) as u32 % 3)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(n) = name {
+            play(&mut commands, &assets, &n, 0.7 * vol);
+        }
+    }
+    if prev.len() > 400 {
+        prev.clear();
+    }
+}

@@ -9,7 +9,7 @@ use bevy_quinnet::shared::channels::{ChannelConfig, SendChannelsConfiguration};
 use serde::{Deserialize, Serialize};
 
 /// Tăng khi đổi định dạng thông điệp; client và server khác phiên bản sẽ bị từ chối.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 6000;
 pub const MAX_PLAYERS: usize = 8;
 /// Giới hạn kích thước chuỗi ngoại hình (JSON) client gửi lên.
@@ -20,8 +20,8 @@ pub const CH_RELIABLE: u8 = 0;
 pub const CH_UNRELIABLE: u8 = 1;
 
 /// Điểm hồi sinh khi người chơi gục.
-pub const RESPAWN_POINT: [f32; 3] = [0.0, 40.0, 0.0];
-pub const PLAYER_MAX_HP: f32 = 100.0;
+pub const RESPAWN_POINT: [f32; 3] = redstoric_common::rules::player::RESPAWN_POINT;
+pub const PLAYER_MAX_HP: f32 = redstoric_common::rules::player::MAX_HP;
 
 /// Cấu hình kênh gửi dùng chung cho client và server (thứ tự quyết định id kênh: 0 và 1).
 pub fn channels() -> SendChannelsConfiguration {
@@ -38,11 +38,15 @@ pub struct PlayerState {
     /// Góc quay quanh trục Y (radian).
     pub yaw: f32,
     pub moving: bool,
+    /// Chức nghiệp (chỉ số trong `redstoric_core::weapons::WEAPONS`)
+    pub class: u8,
+    /// Đang trong nhát đánh
+    pub attacking: bool,
 }
 
 impl PlayerState {
     pub fn is_valid(&self) -> bool {
-        self.pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e6) && self.yaw.is_finite()
+        self.pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e6) && self.yaw.is_finite() && (self.class as usize) < redstoric_core::weapons::WEAPONS.len()
     }
 }
 
@@ -55,7 +59,9 @@ pub enum ClientMsg {
     /// Vị trí hiện tại (kênh không tin cậy).
     State(PlayerState),
     /// Chém trúng boss có khoá `boss` (toạ độ nguyên điểm spawn). Server tự kiểm tra tầm đánh.
-    Attack { boss: [i32; 2] },
+    Attack { boss: [i32; 2], class: u8 },
+    /// Đạn / hiệu ứng vũ khí vừa tạo (0 tên, 1 cầu lửa, 2 tia xanh, 3 nện búa, 4 xoay rìu); server phát lại cho người ở gần.
+    Fire { kind: u8, pos: [f32; 3], dir: [f32; 3] },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +93,10 @@ pub enum ServerMsg {
     PlayerAppearance { id: u64, appearance: String },
     /// Server bắt client về vị trí này (di chuyển bất hợp lệ hoặc hồi sinh).
     Teleport { pos: [f32; 3] },
+    /// Giờ trong ngày và cường độ mưa mục tiêu do server quyết định.
+    Env { hour: f32, rain: f32 },
+    /// Hiệu ứng vũ khí của người chơi khác.
+    Fx { id: u64, kind: u8, pos: [f32; 3], dir: [f32; 3] },
     /// Boss đã bị hạ vĩnh viễn trong phiên server này.
     BossDown { boss: [i32; 2] },
     /// Trạng thái thế giới ~20 lần/giây (kênh không tin cậy).

@@ -55,7 +55,7 @@ impl VoxelWorldMap {
         let mut floor_h = 0.0;
         for y in (0..=base).rev() {
             let b = chunk.get_block(lx, y as usize, lz);
-            if !b.is_air() && !b.is_foliage() {
+            if !b.is_air() && !b.is_foliage() && b != crate::block::BlockType::Water {
                 floor_h = y as f32 + 1.0;
                 break;
             }
@@ -71,5 +71,22 @@ impl VoxelWorldMap {
             }
         }
         (floor_h, blocked)
+    }
+
+    /// Khối tại toạ độ thế giới (None nếu chunk chưa có hoặc ngoài chiều cao).
+    pub fn block_at(&self, x: f32, y: f32, z: f32) -> Option<crate::block::BlockType> {
+        let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        if by < 0 || by >= CHUNK_SIZE_Y as i32 {
+            return None;
+        }
+        let chunk = self.chunks.get(&(
+            bx.div_euclid(CHUNK_SIZE_X as i32),
+            bz.div_euclid(CHUNK_SIZE_Z as i32),
+        ))?;
+        Some(chunk.get_block(
+            bx.rem_euclid(CHUNK_SIZE_X as i32) as usize,
+            by as usize,
+            bz.rem_euclid(CHUNK_SIZE_Z as i32) as usize,
+        ))
     }
 }

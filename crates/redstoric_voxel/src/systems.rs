@@ -1,11 +1,13 @@
 use bevy::prelude::*;
-use crate::prop::{BossSpawnPoint, PropSpawnData, WorldProp, WorldPropKind};
+use crate::prop::{NightLamp, BossSpawnPoint, PropSpawnData, VillagerSpawn, WorldProp, WorldPropKind};
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use crate::chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Z};
 use crate::map::VoxelWorldMap;
-use crate::meshing::build_greedy_mesh;
+use crate::meshing::{build_greedy_mesh, generate_water_mesh};
 use crate::worldgen::CHUNK_SIZE_Y;
+use crate::preload::{PreloadedProps, WorldPreload};
 use crate::WorldGenerator;
+use redstoric_common::chunk_in_world;
 /// Đánh dấu Entity là tâm điểm để hệ thống stream chunk xung quanh (thường gắn vào Player)
 #[derive(Component, Default)]
 pub struct VoxelViewer;
@@ -34,14 +36,73 @@ pub struct ChunkComponent {
 #[derive(Resource)]
 pub struct TerrainMaterial(pub Handle<StandardMaterial>);
 
+/// Vật liệu mặt nước dùng chung; `redstoric_core::weather` đổi màu theo bầu trời và trượt normal map.
+#[derive(Resource)]
+pub struct WaterMaterial(pub Handle<StandardMaterial>);
+
+/// Normal map gợn sóng tuần hoàn (tổng các sóng sin có chu kỳ nguyên nên ghép nối liền mạch).
+fn make_water_normal_map() -> Image {
+    use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    const N: usize = 128;
+    // (kx, ky, biên độ, pha): độ dốc của h = Σ a·sin(2π(kx·x + ky·y)/N + pha)
+    let waves = [(2.0, 1.0, 0.55, 0.0), (-1.0, 3.0, 0.4, 1.3), (4.0, -2.0, 0.25, 2.1), (5.0, 4.0, 0.15, 0.7)];
+    let mut data = Vec::with_capacity(N * N * 4);
+    for y in 0..N {
+        for x in 0..N {
+            let (mut dx, mut dy) = (0.0f32, 0.0f32);
+            for &(kx, ky, a, ph) in &waves {
+                let k = std::f32::consts::TAU / N as f32;
+                let c = ((kx * x as f32 + ky * y as f32) * k + ph).cos() * a * k;
+                dx += c * kx;
+                dy += c * ky;
+            }
+            let n = Vec3::new(-dx * 5.0, -dy * 5.0, 1.0).normalize();
+            data.extend([
+                ((n.x * 0.5 + 0.5) * 255.0) as u8,
+                ((n.y * 0.5 + 0.5) * 255.0) as u8,
+                ((n.z * 0.5 + 0.5) * 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    let mut img = Image::new(
+        Extent3d { width: N as u32, height: N as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Unorm,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    img
+}
+
 /// Component chứa tác vụ tính toán Noise & Mesh ngầm trên CPU Worker Thread
 #[derive(Component)]
-pub struct ChunkGenTask(pub Task<(i32, i32, ChunkData, Mesh, Vec<PropSpawnData>)>);
+/// `Option<ChunkData>`: `Some` khi chunk vừa được sinh mới (ngoài biên thế giới hoặc tắt tải trước),
+/// `None` khi chunk đã có sẵn trong `VoxelWorldMap` và chỉ cần dựng mesh.
+pub struct ChunkGenTask(pub Task<(i32, i32, Option<ChunkData>, Mesh, Vec<PropSpawnData>)>);
 /// Khởi tạo Material địa hình lúc khởi động game
 pub fn setup_voxel_world(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
+    let water = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.04,
+        reflectance: 0.9,
+        alpha_mode: AlphaMode::Blend,
+        normal_map_texture: Some(images.add(make_water_normal_map())),
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    commands.insert_resource(WaterMaterial(water));
     let material = materials.add(StandardMaterial {
         base_color: Color::WHITE, // Giữ màu trắng để nhân 1:1 với màu đỉnh (Vertex Color)
         perceptual_roughness: 0.9,
@@ -51,6 +112,17 @@ pub fn setup_voxel_world(
     });
     commands.insert_resource(TerrainMaterial(material));
 }
+/// Giữ người chơi trong biên thế giới hữu hạn.
+pub fn clamp_viewer_to_world(mut q: Query<&mut Transform, With<VoxelViewer>>) {
+    let lim = redstoric_common::WORLD_LIMIT;
+    for mut t in &mut q {
+        let c = Vec3::new(t.translation.x.clamp(-lim, lim), t.translation.y, t.translation.z.clamp(-lim, lim));
+        if c != t.translation {
+            t.translation = c;
+        }
+    }
+}
+
 /// Hệ thống quét tọa độ người chơi: Sinh chunk mới và xóa chunk ở quá xa
 pub fn chunk_streaming_system(
     mut commands: Commands,
@@ -59,6 +131,8 @@ pub fn chunk_streaming_system(
     // Lấy vị trí của bất kỳ entity nào có gắn VoxelViewer
     viewer_query: Query<&Transform, With<VoxelViewer>>,
     settings: Res<VoxelStreamSettings>,
+    preload: Res<WorldPreload>,
+    props_cache: Res<PreloadedProps>,
 ) {
     let Ok(viewer_transform) = viewer_query.single() else { return; };
     let load_distance = settings.load_distance;
@@ -75,7 +149,7 @@ pub fn chunk_streaming_system(
         for dz in -load_distance..=load_distance {
             if dx * dx + dz * dz <= load_distance * load_distance {
                 let coord = (player_cx + dx, player_cz + dz);
-                if !voxel_map.chunks.contains_key(&coord) && !voxel_map.loading_chunks.contains(&coord) {
+                if !voxel_map.chunk_entities.contains_key(&coord) && !voxel_map.loading_chunks.contains(&coord) {
                     let dist_sq = dx * dx + dz * dz;
                     chunks_to_load.push((dist_sq, coord));
                 }
@@ -86,15 +160,26 @@ pub fn chunk_streaming_system(
     // Ưu tiên tải từ gần đến xa
     chunks_to_load.sort_by_key(|(dist, _)| *dist);
 
-    // Bắn tác vụ sang các luồng worker chạy ngầm
-    for (_, coord) in chunks_to_load.into_iter().take(2) {
+    // Bắn tác vụ sang các luồng worker. Chunk đã có dữ liệu (tải trước) chỉ cần dựng mesh;
+    // chunk chưa có (ngoài biên thế giới, hoặc tắt tải trước) thì sinh mới rồi dựng mesh.
+    for (_, coord) in chunks_to_load.into_iter().take(MAX_NEW_TASKS_PER_FRAME) {
         voxel_map.loading_chunks.insert(coord);
+        let cached = voxel_map.chunks.get(&coord).cloned();
+        let cached_props = props_cache.0.get(&coord).cloned();
         let world_gen = generator.clone();
 
         let task = pool.spawn(async move {
-            let (chunk, props) = world_gen.generate_chunk_with_props(coord.0, coord.1);
-            let mesh = build_greedy_mesh(&chunk).unwrap();
-            (coord.0, coord.1, chunk, mesh, props)
+            match cached {
+                Some(chunk) => {
+                    let mesh = build_greedy_mesh(&chunk, coord.0, coord.1).unwrap();
+                    (coord.0, coord.1, None, mesh, cached_props.unwrap_or_default())
+                }
+                None => {
+                    let (chunk, props) = world_gen.generate_chunk_with_props(coord.0, coord.1);
+                    let mesh = build_greedy_mesh(&chunk, coord.0, coord.1).unwrap();
+                    (coord.0, coord.1, Some(chunk), mesh, props)
+                }
+            }
         });
 
         commands.spawn(ChunkGenTask(task));
@@ -114,12 +199,17 @@ pub fn chunk_streaming_system(
         if let Some(entity) = voxel_map.chunk_entities.remove(&coord) {
             commands.entity(entity).despawn();
         }
-        voxel_map.chunks.remove(&coord);
+        // Chunk trong biên thế giới đã tải trước thì giữ dữ liệu (va chạm, minimap, dựng lại nhanh).
+        if !(preload.keep_data && chunk_in_world(coord.0, coord.1)) {
+            voxel_map.chunks.remove(&coord);
+        }
     }
 }
 
 /// Số chunk tối đa được nhận từ worker mỗi frame, tránh giật khi nhiều chunk xong cùng lúc
-const MAX_CHUNKS_PER_FRAME: usize = 2;
+const MAX_CHUNKS_PER_FRAME: usize = 4;
+/// Số tác vụ dựng mesh mới bắn đi mỗi frame
+const MAX_NEW_TASKS_PER_FRAME: usize = 6;
 /// Số chunk được spawn props mỗi frame
 const MAX_PROP_CHUNKS_PER_FRAME: usize = 1;
 
@@ -135,6 +225,7 @@ pub fn handle_chunk_tasks(
     mut voxel_map: ResMut<VoxelWorldMap>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Option<Res<TerrainMaterial>>,
+    water: Option<Res<WaterMaterial>>,
 ) {
     let Some(material) = material else { return; };
     let mut accepted = 0;
@@ -145,7 +236,9 @@ pub fn handle_chunk_tasks(
         }
         if let Some((cx, cz, chunk, mesh, props)) = block_on(future::poll_once(&mut task.0)) {
             accepted += 1;
-            voxel_map.chunks.insert((cx, cz), chunk);
+            if let Some(chunk) = chunk {
+                voxel_map.chunks.insert((cx, cz), chunk);
+            }
             voxel_map.loading_chunks.remove(&(cx, cz));
 
             // Spawn chunk địa hình. `ChunkComponent` giúp các hệ thống khác (vd. sửa vật liệu
@@ -161,6 +254,21 @@ pub fn handle_chunk_tasks(
                 ChunkComponent { coord: IVec2::new(cx, cz) },
                 PendingProps(props),
             )).id();
+
+            // Mặt nước: dựng trên luồng chính từ dữ liệu chunk, gắn làm con để bị xoá cùng chunk
+            if let (Some(water), Some(data)) = (water.as_ref(), voxel_map.chunks.get(&(cx, cz))) {
+                if let Some(water_mesh) = generate_water_mesh(data, cx, cz) {
+                    commands.entity(chunk_entity).with_children(|c| {
+                        c.spawn((
+                            Mesh3d(meshes.add(water_mesh)),
+                            MeshMaterial3d(water.0.clone()),
+                            // Mesh nước dùng toạ độ cục bộ của chunk nên không cần Transform thêm
+                            Transform::IDENTITY,
+                            bevy::light::NotShadowCaster,
+                        ));
+                    });
+                }
+            }
 
             voxel_map.chunk_entities.insert((cx, cz), chunk_entity);
             commands.entity(task_entity).despawn();
@@ -214,8 +322,41 @@ pub fn spawn_chunk_props(
                     ));
                     continue;
                 }
+                if let WorldPropKind::Villager { seed, job } = prop.kind {
+                    parent.spawn((
+                        Transform::from_translation(prop.world_pos - chunk_origin).with_rotation(prop.rotation),
+                        Visibility::default(),
+                        VillagerSpawn { seed, job },
+                    ));
+                    continue;
+                }
+                let glb_path = prop.kind.glb_asset_path();
+                // Đèn: thêm một PointLight ấm, bật ban đêm
+                let lamp = if glb_path.contains("street_lamp") {
+                    Some((2.6, 220_000.0, 18.0))
+                } else if glb_path.contains("lantern") || glb_path.contains("lamp_") {
+                    Some((0.9, 90_000.0, 10.0))
+                } else if glb_path.contains("candle") {
+                    Some((0.6, 40_000.0, 6.0))
+                } else {
+                    None
+                };
+                if let Some((h, intensity, range)) = lamp {
+                    parent.spawn((
+                        PointLight {
+                            color: Color::srgb(1.0, 0.72, 0.42),
+                            intensity: 0.0,
+                            range,
+                            shadow_maps_enabled: false,
+                            ..default()
+                        },
+                        Transform::from_translation(prop.world_pos - chunk_origin + Vec3::Y * h),
+                        Visibility::Hidden,
+                        NightLamp { intensity },
+                    ));
+                }
                 let scene_handle = asset_server.load(
-                    GltfAssetLabel::Scene(0).from_asset(prop.kind.glb_asset_path()),
+                    GltfAssetLabel::Scene(0).from_asset(glb_path),
                 );
 
                 parent.spawn((
@@ -254,7 +395,7 @@ pub fn spawn_chunks_around_player(
             // 1. Sinh dữ liệu voxel cho chunk
             let chunk_data = world_gen.generate_chunk(cx, cy);
             // 2. Chuyển mảng khối thành Mesh 3D
-            if let Some(mesh) = crate::meshing::generate_chunk_mesh(&chunk_data) {
+            if let Some(mesh) = crate::meshing::generate_chunk_mesh(&chunk_data, cx, cy) {
                 let world_pos = Vec3::new(
                     (cx * CHUNK_SIZE_X as i32) as f32,
                     0.0,

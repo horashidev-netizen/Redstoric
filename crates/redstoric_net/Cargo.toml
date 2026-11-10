@@ -8,6 +8,7 @@ bevy = { workspace = true }
 bevy_quinnet = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { workspace = true }
+redstoric_common = { path = "../redstoric_common" }
 redstoric_core = { path = "../redstoric_core" }
 redstoric_voxel = { path = "../redstoric_voxel" }
 redstoric_combat_ai = { path = "../redstoric_combat_ai" }

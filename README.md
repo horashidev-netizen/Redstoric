@@ -41,7 +41,9 @@ cận chiến và chế độ nhiều người chơi chạy trên **QUIC** với
 | Nhân vật | Dựng từ các mảnh model, trình tạo nhân vật (F7), hoạt ảnh đi bộ theo thủ tục |
 | Chiến đấu | Đánh kiếm, kiểm tra trúng theo tầm và góc, knockback, hiệu ứng chớp đỏ, boss có máy trạng thái, HUD |
 | Multiplayer | Server chuyên dụng (dedicated), tối đa 8 người, boss và máu do server quyết định, đồng bộ snapshot 20 Hz |
-| Giao diện | Minimap, bộ đếm FPS, menu đồ hoạ với chế độ chất lượng tự động |
+| Dân làng | NPC theo nghề (nông dân, thợ rèn, thương nhân...), bảng tên trên đầu, gợi ý `E Talk / T Trade`, hội thoại và cửa hàng tối giản |
+| Cảnh quan | Hàng rào và cổng quanh ruộng, đèn đường, cổ thụ khổng lồ, khinh khí cầu bằng khối bay trên làng |
+| Giao diện | Minimap kiểu Veloren (tên địa danh, N/E/S/W, thu phóng), bộ đếm FPS, menu đồ hoạ với chế độ chất lượng tự động |
 | Công cụ | `batch_vox`: chuyển `.vox` sang `.glb` |
 
 ## Bắt đầu nhanh
@@ -96,14 +98,38 @@ Có thể dùng biến môi trường thay cho tham số dòng lệnh:
 | Xoay camera | Giữ chuột phải + di chuyển chuột |
 | Zoom | Con lăn chuột |
 | Đánh | Chuột trái |
+| Nói chuyện / giao dịch với dân làng (đứng gần) | `E` / `T` (mua bằng `1`-`4`, đóng bằng `Esc`) |
+| Thu phóng minimap | Nút `-` `+` trên minimap hoặc phím `-` `=` |
 | Trình tạo nhân vật | `F7` |
 | Bật/tắt FPS | `F3` |
 | Đổi chế độ chất lượng | `F4` (Auto → Low → Medium → High → Ultra) |
 | Menu đồ hoạ | `F10` |
+| Tua nhanh 1 giờ (ngày/đêm) | `F8` |
+| Bật/tắt mưa | `F6` |
+| Chạy nước rút | giữ `Shift` |
+| Nhảy / bơi lên | `Space` |
+| Lặn xuống | `Ctrl` (khi ở dưới nước) |
+| Leo vách | đi thẳng vào vách (có giới hạn sức bám) |
+
+## Động vật hoang dã
+
+Heo, thỏ, hươu và sói (model lấy từ `assets/placeholders/glb/npc/`) sinh ra theo cách Veloren làm:
+
+- **Spawn** (`redstoric_common::fauna`): mỗi chunk có xác suất chứa một bầy tuỳ vùng sinh thái, giờ trong ngày (sói chỉ ra buổi chiều tối và ban đêm) và cỡ bầy. Thú xuất hiện khi chunk vào tầm 5 chunk và bị xoá khi đi quá 7 chunk. `REDSTORIC_NO_FAUNA=1` tắt hẳn.
+- **AI** (`redstoric_combat_ai::fauna`): lang thang bằng `bearing` random-walk kéo về nhà (30 tick/giây), dừng trước vách, vực và nước, thỉnh thoảng cúi gặm cỏ. Nhận biết người chơi qua tầm nhìn/nghe và thanh `awareness`, rồi Alert → chạy trốn (heo, thỏ, hươu) hoặc đuổi cắn (sói, cả bầy cùng báo động, bỏ chạy khi máu thấp).
+- **Hoạt ảnh**: chu kỳ chân, nhún thân, cúi đầu, vẫy đuôi theo `quadruped_small/medium` của Veloren. Bộ khung `fauna/layout.rs` sinh tự động từ manifest của Veloren.
+- Thú chỉ có ở phía client và không đồng bộ qua mạng. Khi chơi online, sói không gây sát thương.
+
+## Thời tiết và mặt nước
+
+- **Mưa** (`redstoric_core::weather`): hạt mưa rơi trong hình trụ quanh camera, dừng lại khi chạm khối (lá cây che được mưa), cơn mưa tự đến và tạnh theo lịch ngẫu nhiên, trời xám dần và nắng yếu đi. `F6` bật/tắt ngay, `REDSTORIC_RAIN=1` bắt đầu trong mưa.
+- **Mặt nước**: dựng thành mesh riêng với vật liệu bóng, trong suốt; màu pha theo màu bầu trời, normal map gợn sóng trượt liên tục (nhanh hơn khi mưa). Đây là phản chiếu giả theo màu trời, chưa phản chiếu thật cảnh vật.
+- **Gợn sóng**: vòng sóng lan ra khi hạt mưa rơi xuống nước và khi người chơi lội hoặc bơi.
+- **Cá**: Clownfish và Piranha bơi thành đàn ở hồ, sông (`redstoric_combat_ai::fauna::fish`), tránh bờ và lao đi khi người chơi lại gần. Mô hình lấy từ `fish_small` của Veloren.
 
 ## Kiến trúc tổng quan
 
-Workspace gồm 4 crate và 2 binary:
+Workspace gồm 5 crate và 2 binary. Lõi mô phỏng nằm ở `redstoric_common` (không phụ thuộc đồ hoạ) và được client lẫn server dùng chung, theo tinh thần crate `common` của Veloren:
 
 ```mermaid
 flowchart TD
@@ -113,22 +139,25 @@ flowchart TD
     subgraph Srv["redstoric_server (binary)"]
         SMAIN[src/bin/redstoric_server.rs]
     end
+    COM[redstoric_common<br/>block · chunk · worldgen · structures · rules]
     CORE[redstoric_core<br/>nhân vật · camera · UI · đồ hoạ]
-    VOX[redstoric_voxel<br/>block · chunk · worldgen · mesh · props]
+    VOX[redstoric_voxel<br/>map · mesh · streaming · props ECS]
     CMB[redstoric_combat_ai<br/>đánh · boss · máu · HUD]
     NET[redstoric_net<br/>giao thức · client · server]
 
     MAIN --> CORE & VOX & CMB & NET
     SMAIN --> NET
     CORE --> VOX
-    CMB --> VOX
-    NET --> VOX & CMB & CORE
+    CMB --> VOX & COM
+    VOX --> COM
+    NET --> COM & VOX & CMB & CORE
 ```
 
 | Crate | Trách nhiệm |
 | --- | --- |
+| `redstoric_common` | **Lõi dùng chung, không đồ hoạ**: khối, chunk, sinh thế giới, cấu trúc, danh mục sprite, dữ liệu prop, `rules` (hằng số cân bằng boss/người chơi, nguồn sự thật duy nhất cho offline và server) |
 | `redstoric_core` | Điều khiển nhân vật, camera orbit, trình tạo nhân vật, hoạt ảnh, minimap, FPS, hệ thống đồ hoạ, material voxel |
-| `redstoric_voxel` | Định nghĩa khối, chunk, bản đồ voxel, sinh địa hình, cấu trúc (làng, đấu trường), sprite/prop, dựng mesh, streaming |
+| `redstoric_voxel` | Phía client: bản đồ voxel, dựng mesh, streaming chunk, spawn prop. Re-export `redstoric_common` nên đường dẫn cũ vẫn dùng được |
 | `redstoric_combat_ai` | Tấn công, kiểm tra trúng, máu người chơi, boss AI, hiệu ứng, HUD, bù nhìn tập đánh |
 | `redstoric_net` | Giao thức `ClientMsg`/`ServerMsg`, plugin client, plugin server, đồng bộ trạng thái |
 
@@ -152,6 +181,25 @@ Khi kết nối thành công, tài nguyên `OnlineMode(true)` tắt `boss_ai_sys
 client mà được gom vào `PendingBossHits` rồi gửi lên server.
 
 ## Hệ thống thế giới
+
+### Hòn đảo hữu hạn
+
+Thế giới là hình vuông `2 * WORLD_HALF` (mặc định 2048 khối) với một hòn đảo ở giữa, bao quanh bởi biển.
+Người chơi bị giữ trong biên. Núi tuyết ở phía tây, sa mạc ở phía đông, đồng bằng và rừng ở giữa,
+cùng hồ, sông và bờ biển lồi lõm. Các hằng số hình dạng nằm trong `generation.rs`
+(`island_value`, `get_surface_height`, `get_climate`).
+
+### Tải trước toàn bộ thế giới
+
+Vì thế giới hữu hạn, lúc vào game toàn bộ chunk của hòn đảo được sinh một lần trên các luồng
+worker, kèm màn hình tải có thanh tiến độ (`redstoric_voxel/src/preload.rs`). Dữ liệu khối và
+danh sách prop được giữ trong bộ nhớ (khoảng 270 MB với `WORLD_HALF = 1024`), nên khi chơi:
+
+- không còn sinh địa hình, cây, làng giữa chừng, hết giật khi chạy sang vùng mới;
+- chunk ở xa chỉ bị dỡ mesh chứ không mất dữ liệu; va chạm và minimap đúng trên cả đảo;
+- chỉ phần trong tầm nhìn được dựng mesh và spawn (vẽ cả đảo cùng lúc sẽ làm FPS tụt).
+
+Đặt `REDSTORIC_NO_PRELOAD=1` để tắt và quay lại sinh theo yêu cầu (tiện khi phát triển).
 
 ### Chunk và streaming
 
@@ -295,8 +343,9 @@ sequenceDiagram
 │   ├── shaders/
 │   └── voxygen/                 # Asset tham khảo kiểu Veloren
 ├── crates/
+│   ├── redstoric_common/        # Lõi dùng chung: block, chunk, worldgen, structures, sprites, rules
 │   ├── redstoric_core/          # Nhân vật, camera, UI, đồ hoạ
-│   ├── redstoric_voxel/         # Voxel, worldgen, structures, sprites, mesh
+│   ├── redstoric_voxel/         # Client: map, mesh, streaming, props ECS
 │   ├── redstoric_combat_ai/     # Combat, boss, HUD
 │   └── redstoric_net/           # Giao thức, client, server
 ├── src/
@@ -324,7 +373,7 @@ Tool xử lý model đầu tiên trong mỗi file `.vox`, bỏ mặt bị che, g
 
 1. Đặt file `.glb` vào `assets/placeholders/glb/sprite/` (có thể chia thư mục con theo nhóm).
 2. Chạy lại game; catalog tự quét, tự lấy độ lệch chân.
-3. Muốn sprite xuất hiện ở biome nào thì thêm tên vào bảng tương ứng trong `crates/redstoric_voxel/src/sprites.rs`.
+3. Muốn sprite xuất hiện ở biome nào thì thêm tên vào bảng tương ứng trong `crates/redstoric_common/src/sprites.rs`.
 
 ## Cấu hình và file dữ liệu
 
@@ -357,13 +406,13 @@ Quy ước làm việc:
 - `WORLD_SEED` cố định trong code, chưa cấu hình được.
 - Boss đã hạ chỉ được nhớ trong một phiên server, chưa lưu xuống đĩa.
 - Chưa có menu nhập địa chỉ server; dùng tham số dòng lệnh.
-- Luật boss hiện được cài đặt ở hai nơi (`combat_ai/boss.rs` và `redstoric_net/server.rs`) với cùng hằng số.
+- Hằng số boss đã dùng chung qua `redstoric_common::rules`, nhưng máy trạng thái boss vẫn được cài đặt hai lần (`combat_ai/boss.rs` cho offline, `redstoric_net/server.rs` cho server).
 - Chưa có lưu thế giới, chỉnh sửa khối đồng bộ, hay lag compensation.
 
 ## Lộ trình
 
-1. Tách `redstoric_common` (không đồ hoạ): block, chunk, `WorldGenerator`, structures, luật chơi, giao thức.
-2. Gộp luật boss thành hàm thuần dùng chung cho client và server.
+1. ~~Tách `redstoric_common`~~ (xong): block, chunk, `WorldGenerator`, structures, sprites, hằng số luật chơi.
+2. Gộp máy trạng thái boss thành hàm thuần trong `redstoric_common` dùng chung cho client và server (hằng số đã gộp).
 3. Server nhúng cho chế độ chơi đơn (cùng một đường code với multiplayer).
 4. Combat dựa trên sự kiện thay vì sửa máu trực tiếp.
 5. Dữ liệu dạng file (RON/JSON): block, prop, boss, loot.
@@ -374,3 +423,46 @@ Quy ước làm việc:
 ## Giấy phép
 
 Phát hành theo **GNU General Public License v3.0**. Xem [LICENSE](LICENSE).
+
+## Hậu kỳ & màu sắc
+- Camera dùng HDR + Bloom + tonemapping TonyMcMapface (đèn, mặt trời loá nhẹ).
+- Màu khối biến thiên theo vùng (nhiễu giá trị theo toạ độ thế giới): cỏ/lá ngả vàng–xanh, cát/đất/đá sáng tối theo mảng.
+
+## Âm thanh
+- Dùng bộ âm thanh Veloren (`assets/placeholders/voxygen/audio`): nhạc nền theo giờ/mưa, gió, mưa, suối gần nước, chim ban ngày, dế/cú/ếch ban đêm, sấm, bước chân theo loại khối, nhảy/đáp/bơi, đòn đánh, tiếng thú. F10 tắt/bật tiếng.
+
+- Chém kiếm: cả cánh tay phải vung (giơ cao -> chém chéo xuống), có vệt chém sáng dạng cung (`animation.rs`).
+
+## Vũ khí theo chức nghiệp
+Mỗi người chơi chỉ có **một** chức nghiệp: lần đầu vào game menu nhân vật (F7) tự mở, chọn chức nghiệp (hàng `Class`) + ngoại hình rồi bấm **Confirm** để khoá chức nghiệp. Sau đó vẫn đổi được ngoại hình bằng F7. Muốn chọn lại chức nghiệp: xoá `character_appearance.json`. Chuột trái để đánh. Model lấy từ `assets/placeholders/glb/weapon`, vị trí cầm theo `biped_weapon_manifest.ron` của Veloren.
+
+| # | Chức nghiệp | Cách đánh |
+|---|---|---|
+| 1 | Kiếm sĩ (kiếm) | Chém chéo nhanh, hình quạt phía trước, có vệt chém |
+| 2 | Chiến binh rìu | Quét một vòng quanh người, trúng mọi mục tiêu trong tầm |
+| 3 | Chiến binh búa | Nện xuống chậm, sát thương lớn, sóng xung kích hình tròn |
+| 4 | Cung thủ (cung) | Bắn tên (rơi theo trọng lực), tự ngắm mục tiêu trước mặt |
+| 5 | Pháp sư lửa (trượng) | Cầu lửa nổ lan bán kính 3.5 khối |
+| 6 | Mục sư (quyền trượng) | Tia xanh gây sát thương nhẹ, mỗi lần trúng hồi máu cho người chơi |
+
+Chỉ số từng vũ khí nằm ở bảng `WEAPONS` trong `crates/redstoric_core/src/weapons.rs`.
+
+## Chạy trên điện thoại (Android)
+
+1. Cài một lần: `rustup target add aarch64-linux-android`, `cargo install cargo-apk`, Android SDK + NDK (đặt `ANDROID_HOME`, `ANDROID_NDK_ROOT`).
+2. Tạo manifest nhúng (APK không quét được thư mục): `cargo run --bin dump_manifests`.
+3. Gói asset nhẹ (vài chục MB thay vì 946 MB): `python tools/pack_mobile_assets.py` (chạy trực tiếp trên ổ đĩa máy, tạo `target/mobile_assets`).
+4. Build: `REDSTORIC_DEFAULT_SERVER=IP_VPS:6000 cargo apk build --release` (PowerShell: `$env:REDSTORIC_DEFAULT_SERVER="IP:6000"`). Bỏ biến này nếu chỉ chơi offline.
+5. Cài: `cargo apk run --release` hoặc `adb install target/release/apk/Redstoric.apk`.
+
+Điều khiển cảm ứng: nửa trái = joystick, nửa phải = xoay camera, nút "Danh", "Nhay", "F7" (chọn class).
+Thử giao diện cảm ứng trên PC: đặt `REDSTORIC_TOUCH=1`.
+
+## Server trên VPS
+
+```
+cargo build --release --bin redstoric_server
+./target/release/redstoric_server        # UDP 6000 (QUIC)
+```
+Mở cổng **UDP 6000** trên firewall. Chạy nền bằng systemd (`ExecStart=/opt/redstoric/redstoric_server`, `Restart=always`).
+Đã đồng bộ: class/vũ khí/đòn đánh, ngày đêm + thời tiết. Chưa: động vật, đặt/phá block (game chưa có tính năng phá/đặt block).

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use bevy::math::{Quat, Vec3};
+use bevy_math::{Quat, Vec3};
 
 use crate::block::BlockType;
 use crate::chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
@@ -86,15 +86,36 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-fn build_catalog() -> Catalog {
-    let mut catalog = Catalog { defs: Vec::new(), by_cat: HashMap::new(), by_name: HashMap::new() };
-    let Some(base) = find_sprite_dir() else {
-        bevy::log::warn!("Không tìm thấy thư mục {SPRITE_DIR}; sẽ không có sprite");
-        return catalog;
-    };
+/// Danh mục sprite dựng sẵn (do `cargo run --bin dump_manifests` sinh ra) dùng khi không có thư mục
+/// asset trên đĩa, ví dụ trong APK Android: mỗi phần tử là `[đường dẫn, độ cao đáy model]`.
+const EMBEDDED_MANIFEST: &str = include_str!("../../../assets_manifest/sprite_catalog.json");
+
+/// Xuất danh mục sprite hiện có trên đĩa thành JSON (xem `EMBEDDED_MANIFEST`).
+pub fn dump_manifest_json() -> String {
+    let Some(base) = find_sprite_dir() else { return "[]".to_string() };
     let mut files = Vec::new();
     walk(&base, "", &mut files);
-    for (rel, disk) in files {
+    let list: Vec<serde_json::Value> =
+        files.iter().map(|(rel, disk)| serde_json::json!([rel, read_min_y(disk)])).collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn build_catalog() -> Catalog {
+    let mut catalog = Catalog { defs: Vec::new(), by_cat: HashMap::new(), by_name: HashMap::new() };
+    // (đường dẫn tương đối, file trên đĩa, độ cao đáy đã biết)
+    let mut files: Vec<(String, PathBuf, Option<f32>)> = Vec::new();
+    if let Some(base) = find_sprite_dir() {
+        let mut found = Vec::new();
+        walk(&base, "", &mut found);
+        files.extend(found.into_iter().map(|(rel, disk)| (rel, disk, None)));
+    } else if let Ok(list) = serde_json::from_str::<Vec<(String, f32)>>(EMBEDDED_MANIFEST) {
+        files.extend(list.into_iter().map(|(rel, min_y)| (rel, PathBuf::new(), Some(min_y))));
+    }
+    if files.is_empty() {
+        eprintln!("Không tìm thấy thư mục {SPRITE_DIR} hay danh mục dựng sẵn; sẽ không có sprite");
+        return catalog;
+    }
+    for (rel, disk, known_min_y) in files {
         if catalog.defs.len() >= u16::MAX as usize {
             break;
         }
@@ -106,13 +127,12 @@ fn build_catalog() -> Catalog {
         let top = cat.split('/').next().unwrap_or("").to_string();
         let path: &'static str = Box::leak(format!("{SPRITE_DIR}/{rel}").into_boxed_str());
         let id = catalog.defs.len() as u16;
-        catalog.defs.push(SpriteDef {
-            name: stem.clone(),
-            path,
-            scale: category_scale(&top),
-            disk,
-            y_offset: OnceLock::new(),
-        });
+        let scale = category_scale(&top);
+        let y_offset = OnceLock::new();
+        if let Some(min_y) = known_min_y {
+            let _ = y_offset.set(-min_y * scale);
+        }
+        catalog.defs.push(SpriteDef { name: stem.clone(), path, scale, disk, y_offset });
         catalog.by_cat.entry(cat).or_default().push(id);
         catalog.by_name.insert(stem, id);
     }

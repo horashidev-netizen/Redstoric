@@ -1,0 +1,386 @@
+//! Đạn và hiệu ứng của vũ khí: cung (tên, rơi theo trọng lực), trượng lửa (cầu lửa nổ lan),
+//! quyền trượng (tia xanh gây sát thương nhẹ và hồi máu cho người chơi), cùng vòng sóng xung kích
+//! cho rìu/búa. Tên bắn có hỗ trợ ngắm: tự nhắm vào mục tiêu gần nhất trong hình nón phía trước.
+use bevy::light::NotShadowCaster;
+use bevy::prelude::*;
+use redstoric_core::weapons::{Loadout, WeaponKind};
+use redstoric_core::{ActionState, Character};
+use redstoric_voxel::{BlockType, VoxelWorldMap};
+
+use crate::attack::apply_hit;
+use crate::boss::Boss;
+use crate::fauna::Animal;
+use crate::types::{DummyTarget, Health, HitFlash, Knockback, MeleeAttacker, OnlineMode, PendingBossHits};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProjKind {
+    Arrow,
+    Fireball,
+    HealBolt,
+}
+
+#[derive(Component)]
+pub struct Projectile {
+    pub kind: ProjKind,
+    vel: Vec3,
+    gravity: f32,
+    damage: f32,
+    life: f32,
+    /// Đạn chỉ để hiển thị (của người chơi khác): không gây sát thương, không hồi máu
+    visual: bool,
+}
+
+/// Hiệu ứng/đạn do mạng báo về, không gửi ngược lên server.
+#[derive(Component)]
+pub struct RemoteFx;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FxKind {
+    Explosion,
+    Slam,
+    Spin,
+    Heal,
+    /// Bụi nhỏ đi kèm sóng xung kích (không phát tiếng, không gửi qua mạng)
+    Dust,
+}
+
+#[derive(Component)]
+pub struct BurstFx {
+    pub kind: FxKind,
+    age: f32,
+    life: f32,
+    from: f32,
+    to: f32,
+    alpha: f32,
+    rgb: (f32, f32, f32),
+    material: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+pub struct FxAssets {
+    pub sphere: Handle<Mesh>,
+    pub ring: Handle<Mesh>,
+    arrow: Handle<Mesh>,
+    arrow_mat: Handle<StandardMaterial>,
+    fire_mat: Handle<StandardMaterial>,
+    heal_mat: Handle<StandardMaterial>,
+}
+
+pub fn setup_fx_assets(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let glow = |r: f32, g: f32, b: f32, k: f32| StandardMaterial {
+        base_color: Color::srgb(r, g, b),
+        emissive: LinearRgba::rgb(r * k, g * k, b * k),
+        unlit: true,
+        ..default()
+    };
+    commands.insert_resource(FxAssets {
+        sphere: meshes.add(Sphere::new(1.0)),
+        ring: meshes.add(Annulus::new(0.78, 1.0)),
+        arrow: meshes.add(Cuboid::new(0.07, 0.07, 0.95)),
+        arrow_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.75, 0.62, 0.40),
+            emissive: LinearRgba::rgb(0.6, 0.5, 0.3),
+            unlit: true,
+            ..default()
+        }),
+        fire_mat: materials.add(glow(1.0, 0.45, 0.10, 9.0)),
+        heal_mat: materials.add(glow(0.45, 1.0, 0.40, 6.0)),
+    });
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Sinh một hiệu ứng nở rộng rồi mờ dần (cầu hoặc vòng).
+pub fn spawn_burst(
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    assets: &FxAssets,
+    kind: FxKind,
+    pos: Vec3,
+    rot: Quat,
+    ring: bool,
+    (from, to, life): (f32, f32, f32),
+    rgb: (f32, f32, f32),
+) -> Entity {
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgba(rgb.0, rgb.1, rgb.2, 0.9),
+        emissive: LinearRgba::rgb(rgb.0 * 4.0, rgb.1 * 4.0, rgb.2 * 4.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Add,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(if ring { assets.ring.clone() } else { assets.sphere.clone() }),
+        MeshMaterial3d(material.clone()),
+        Transform { translation: pos, rotation: rot, scale: Vec3::splat(from) },
+        NotShadowCaster,
+        BurstFx { kind, age: 0.0, life, from, to, alpha: 0.9, rgb, material },
+    ))
+    .id()
+}
+
+pub fn burst_fx_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fx: Query<(Entity, &mut BurstFx, &mut Transform)>,
+) {
+    for (e, mut f, mut tf) in &mut fx {
+        f.age += time.delta_secs();
+        let t = (f.age / f.life).clamp(0.0, 1.0);
+        tf.scale = Vec3::splat(f.from + (f.to - f.from) * ease_out(t));
+        if let Some(mut m) = materials.get_mut(&f.material) {
+            m.base_color = Color::srgba(f.rgb.0, f.rgb.1, f.rgb.2, f.alpha * (1.0 - t));
+        }
+        if t >= 1.0 {
+            commands.entity(e).try_despawn();
+        }
+    }
+}
+
+/// Cung / trượng lửa / quyền trượng: thả đạn ở thời điểm `release` của nhát đánh.
+pub fn ranged_attack_system(
+    mut commands: Commands,
+    loadout: Res<Loadout>,
+    assets: Option<Res<FxAssets>>,
+    mut players: Query<(&Transform, &Character, &mut MeleeAttacker)>,
+    targets: Query<&Transform, (Or<(With<DummyTarget>, With<Boss>, With<Animal>)>, Without<MeleeAttacker>)>,
+) {
+    let Some(assets) = assets else { return };
+    let def = loadout.current();
+    let kind = match def.kind {
+        WeaponKind::Bow => ProjKind::Arrow,
+        WeaponKind::FireStaff => ProjKind::Fireball,
+        WeaponKind::Sceptre => ProjKind::HealBolt,
+        _ => return,
+    };
+
+    for (tf, ch, mut attacker) in &mut players {
+        let ActionState::Attacking(_) = ch.state else { continue };
+        let p = 1.0 - ch.attack_timer / ch.attack_len.max(0.05);
+        if p < def.release || attacker.has_hit {
+            continue;
+        }
+        attacker.has_hit = true;
+
+        let forward = *tf.forward();
+        let origin = tf.translation + Vec3::Y * 1.3 + forward * 0.9;
+
+        // Hỗ trợ ngắm: mục tiêu gần nhất nằm trong hình nón ~37° phía trước
+        let mut dir = (forward + Vec3::Y * if kind == ProjKind::Arrow { 0.04 } else { 0.0 }).normalize();
+        let mut best = f32::MAX;
+        for t in &targets {
+            let aim = t.translation + Vec3::Y * 0.8;
+            let to = aim - origin;
+            let d = to.length();
+            if d < 1.0 || d > def.range {
+                continue;
+            }
+            if forward.dot(Vec3::new(to.x, 0.0, to.z).normalize_or_zero()) > 0.8 && d < best {
+                best = d;
+                // cung: nhắm cao hơn một chút để bù độ rơi
+                let lift = if kind == ProjKind::Arrow { Vec3::Y * d * 0.012 } else { Vec3::ZERO };
+                dir = (to + lift).normalize();
+            }
+        }
+        spawn_projectile(&mut commands, &assets, kind, origin, dir, attacker.damage, false);
+    }
+}
+
+/// Sinh một viên đạn (của mình, hoặc chỉ để hiển thị khi do người chơi khác bắn).
+pub fn spawn_projectile(
+    commands: &mut Commands,
+    assets: &FxAssets,
+    kind: ProjKind,
+    origin: Vec3,
+    dir: Vec3,
+    damage: f32,
+    visual: bool,
+) {
+    let (speed, gravity, life, mesh, mat, scale) = match kind {
+        ProjKind::Arrow => (55.0, 14.0, 2.5, assets.arrow.clone(), assets.arrow_mat.clone(), Vec3::ONE),
+        ProjKind::Fireball => (26.0, 0.0, 3.0, assets.sphere.clone(), assets.fire_mat.clone(), Vec3::splat(0.38)),
+        ProjKind::HealBolt => (32.0, 0.0, 2.0, assets.sphere.clone(), assets.heal_mat.clone(), Vec3::splat(0.26)),
+    };
+    let mut e = commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(mat),
+        Transform { translation: origin, rotation: Transform::default().looking_to(dir, Vec3::Y).rotation, scale },
+        NotShadowCaster,
+        Projectile { kind, vel: dir * speed, gravity, damage, life, visual },
+    ));
+    if visual {
+        e.insert(RemoteFx);
+    }
+    match kind {
+        ProjKind::Fireball => {
+            e.with_children(|c| {
+                c.spawn((
+                    PointLight {
+                        color: Color::srgb(1.0, 0.55, 0.2),
+                        intensity: 160_000.0,
+                        range: 14.0,
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                    Transform::IDENTITY,
+                ));
+            });
+        }
+        ProjKind::HealBolt => {
+            e.with_children(|c| {
+                c.spawn((
+                    PointLight {
+                        color: Color::srgb(0.5, 1.0, 0.45),
+                        intensity: 60_000.0,
+                        range: 8.0,
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                    Transform::IDENTITY,
+                ));
+            });
+        }
+        ProjKind::Arrow => {}
+    }
+}
+
+/// Dựng hiệu ứng do người chơi khác tạo (mã kind: 0 tên, 1 cầu lửa, 2 tia chữa lành, 3 nện búa, 4 xoay rìu).
+pub fn spawn_remote_fx(
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    assets: &FxAssets,
+    kind: u8,
+    pos: Vec3,
+    dir: Vec3,
+) {
+    match kind {
+        0 => spawn_projectile(commands, assets, ProjKind::Arrow, pos, dir, 0.0, true),
+        1 => spawn_projectile(commands, assets, ProjKind::Fireball, pos, dir, 0.0, true),
+        2 => spawn_projectile(commands, assets, ProjKind::HealBolt, pos, dir, 0.0, true),
+        3 => {
+            let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            let a = spawn_burst(commands, materials, assets, FxKind::Slam, pos, flat, true, (0.7, 4.2, 0.4), (1.0, 0.7, 0.4));
+            let b = spawn_burst(commands, materials, assets, FxKind::Dust, pos + Vec3::Y * 0.3, Quat::IDENTITY, false, (0.3, 1.4, 0.3), (0.8, 0.6, 0.4));
+            commands.entity(a).insert(RemoteFx);
+            commands.entity(b).insert(RemoteFx);
+        }
+        4 => {
+            let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            let a = spawn_burst(commands, materials, assets, FxKind::Spin, pos, flat, true, (1.0, 3.6, 0.28), (1.0, 0.9, 0.7));
+            commands.entity(a).insert(RemoteFx);
+        }
+        _ => {}
+    }
+}
+
+fn solid(map: &VoxelWorldMap, p: Vec3) -> bool {
+    matches!(map.block_at(p.x, p.y, p.z), Some(b) if b != BlockType::Air && b != BlockType::Water)
+}
+
+/// Bay, va chạm khối / mục tiêu, nổ (cầu lửa), hồi máu (tia xanh).
+pub fn projectile_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    map: Option<Res<VoxelWorldMap>>,
+    assets: Option<Res<FxAssets>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut projs: Query<(Entity, &mut Transform, &mut Projectile)>,
+    mut targets: Query<
+        (Entity, &Transform, &mut Health, Option<&mut Knockback>, Option<&mut HitFlash>, Option<&Boss>),
+        (Or<(With<DummyTarget>, With<Boss>, With<Animal>)>, Without<Projectile>),
+    >,
+    mut player_hp: Query<&mut Health, (With<Character>, Without<DummyTarget>, Without<Boss>, Without<Animal>)>,
+    online: Res<OnlineMode>,
+    mut pending: ResMut<PendingBossHits>,
+) {
+    let Some(assets) = assets else { return };
+    let dt = time.delta_secs();
+
+    for (entity, mut tf, mut pr) in &mut projs {
+        pr.life -= dt;
+        if pr.life <= 0.0 {
+            commands.entity(entity).try_despawn();
+            continue;
+        }
+
+        // Hai bước nhỏ mỗi khung hình để đạn nhanh không xuyên mục tiêu
+        let mut impact: Option<(Vec3, Option<Entity>)> = None;
+        let sub = dt * 0.5;
+        for _ in 0..2 {
+            let g = pr.gravity;
+            pr.vel.y -= g * sub;
+            tf.translation += pr.vel * sub;
+            if let Some(m) = map.as_ref() {
+                if solid(m, tf.translation) {
+                    impact = Some((tf.translation, None));
+                    break;
+                }
+            }
+            for (te, ttf, _, _, _, _) in targets.iter().filter(|_| !pr.visual) {
+                if (ttf.translation + Vec3::Y * 0.8).distance(tf.translation) < 1.15 {
+                    impact = Some((tf.translation, Some(te)));
+                    break;
+                }
+            }
+            if impact.is_some() {
+                break;
+            }
+        }
+        if pr.vel.length_squared() > 0.01 && pr.kind == ProjKind::Arrow {
+            tf.rotation = Transform::default().looking_to(pr.vel.normalize(), Vec3::Y).rotation;
+        }
+
+        let Some((pos, hit)) = impact else { continue };
+        let dir = pr.vel.normalize_or_zero();
+        if pr.visual {
+            // Đạn của người khác: chỉ hiện hiệu ứng nổ / chữa lành, không tính sát thương
+            match pr.kind {
+                ProjKind::Fireball => { spawn_burst(&mut commands, &mut materials, &assets, FxKind::Explosion, pos, Quat::IDENTITY, false, (0.6, 3.5, 0.35), (1.0, 0.5, 0.15)); }
+                ProjKind::HealBolt => { spawn_burst(&mut commands, &mut materials, &assets, FxKind::Heal, pos, Quat::IDENTITY, false, (0.3, 1.1, 0.25), (0.45, 1.0, 0.4)); }
+                ProjKind::Arrow => {}
+            }
+            commands.entity(entity).try_despawn();
+            continue;
+        }
+        match pr.kind {
+            ProjKind::Arrow | ProjKind::HealBolt => {
+                if let Some(te) = hit {
+                    if let Ok((e, _, mut hp, mut kb, mut fl, boss)) = targets.get_mut(te) {
+                        apply_hit(&mut commands, online.0, &mut pending, e, &mut hp, kb.as_deref_mut(), fl.as_deref_mut(), boss, dir, pr.damage, 9.0);
+                    }
+                    if pr.kind == ProjKind::HealBolt {
+                        for mut hp in &mut player_hp {
+                            hp.current = (hp.current + 8.0).min(hp.max);
+                        }
+                    }
+                }
+                if pr.kind == ProjKind::HealBolt {
+                    spawn_burst(&mut commands, &mut materials, &assets, FxKind::Heal, pos, Quat::IDENTITY, false, (0.3, 1.1, 0.25), (0.45, 1.0, 0.4));
+                }
+            }
+            ProjKind::Fireball => {
+                const RADIUS: f32 = 3.5;
+                for (e, ttf, mut hp, mut kb, mut fl, boss) in targets.iter_mut() {
+                    let d = (ttf.translation + Vec3::Y * 0.8).distance(pos);
+                    if d > RADIUS {
+                        continue;
+                    }
+                    let fall = 1.0 - 0.5 * d / RADIUS;
+                    let away = (ttf.translation - pos).normalize_or_zero();
+                    apply_hit(&mut commands, online.0, &mut pending, e, &mut hp, kb.as_deref_mut(), fl.as_deref_mut(), boss, away, pr.damage * fall, 16.0);
+                }
+                spawn_burst(&mut commands, &mut materials, &assets, FxKind::Explosion, pos, Quat::IDENTITY, false, (0.6, RADIUS, 0.35), (1.0, 0.5, 0.15));
+            }
+        }
+        commands.entity(entity).try_despawn();
+    }
+}

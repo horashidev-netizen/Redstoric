@@ -1,16 +1,27 @@
-use bevy::math::{Quat, Vec3};
-use bevy::prelude::Resource;
+use bevy_math::{Quat, Vec3};
+use bevy_ecs::prelude::Resource;
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin, SuperSimplex};
 use crate::block::BlockType;
 use crate::structures::Site;
 use crate::chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};
-use crate::{PropSpawnData, WorldPropKind};
+use crate::{PropSpawnData, WorldPropKind, WORLD_HALF};
+
+#[inline]
+fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
 #[derive(Resource, Clone)]
 pub struct WorldGenerator {
-    // Độ cao lục địa & đồi núi
-    continental_noise: Fbm<Perlin>,
+    // Hình dáng đảo, đồi núi, hồ, sông
+    coast_noise: Fbm<Perlin>,
+    terrain_noise: Fbm<Perlin>,
     mountain_noise: SuperSimplex,
+    ridge_noise: SuperSimplex,
+    lake_noise: SuperSimplex,
+    river_noise: SuperSimplex,
+    river_warp: SuperSimplex,
     detail_noise: Perlin,
 
     // Khí hậu (Nhiệt độ & Độ ẩm)
@@ -29,15 +40,25 @@ pub struct WorldGenerator {
 
 impl WorldGenerator {
     pub fn new(seed: u32) -> Self {
-        let continental_noise = Fbm::<Perlin>::new(seed)
-            .set_octaves(4)
-            .set_frequency(0.005)
+        let coast_noise = Fbm::<Perlin>::new(seed.wrapping_add(11))
+            .set_octaves(5)
+            .set_frequency(1.0)
+            .set_lacunarity(2.0)
+            .set_persistence(0.5);
+        let terrain_noise = Fbm::<Perlin>::new(seed)
+            .set_octaves(5)
+            .set_frequency(1.0)
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
         Self {
-            continental_noise,
+            coast_noise,
+            terrain_noise,
             mountain_noise: SuperSimplex::new(seed.wrapping_add(101)),
+            ridge_noise: SuperSimplex::new(seed.wrapping_add(808)),
+            lake_noise: SuperSimplex::new(seed.wrapping_add(909)),
+            river_noise: SuperSimplex::new(seed.wrapping_add(1010)),
+            river_warp: SuperSimplex::new(seed.wrapping_add(1111)),
             detail_noise: Perlin::new(seed.wrapping_add(202)),
             temperature_noise: SuperSimplex::new(seed.wrapping_add(303)),
             humidity_noise: SuperSimplex::new(seed.wrapping_add(404)),
@@ -48,23 +69,102 @@ impl WorldGenerator {
         }
     }
 
-    /// Tính độ cao bề mặt kết hợp nhiều tầng Noise
+    /// Độ "đất liền" của một điểm: 0 = biển, 1 = lõi đảo. Thế giới là một hòn đảo hữu hạn
+    /// nằm giữa hình vuông `2 * WORLD_HALF`; bờ biển lồi lõm nhờ noise, ngoài rìa luôn là biển.
     #[inline]
-    pub fn get_surface_height(&self, wx: f64, wz: f64) -> usize {
-        let base = self.continental_noise.get([wx * 0.004, wz * 0.004]);
-        let mtn = self.mountain_noise.get([wx * 0.012, wz * 0.012]).max(0.0).powi(2);
-        let detail = self.detail_noise.get([wx * 0.04, wz * 0.04]) * 0.2;
-
-        let height = (self.sea_level as f64 + (base * 18.0) + (mtn * 22.0) + (detail * 4.0) + 6.0) as isize;
-        height.clamp(3, (CHUNK_SIZE_Y - 8) as isize) as usize
+    pub fn island_value(&self, wx: f64, wz: f64) -> f64 {
+        let half = WORLD_HALF as f64;
+        let nx = wx / half;
+        let nz = wz / half;
+        let coast = self.coast_noise.get([nx * 2.4 + 17.0, nz * 2.4 - 9.0]);
+        let d = (nx * nx + nz * nz).sqrt() * 0.82 + coast * 0.16;
+        let shape = 1.0 - smoothstep(0.50, 0.85, d);
+        // Ép về biển sát rìa thế giới
+        let edge = 1.0 - smoothstep(0.86, 0.97, nx.abs().max(nz.abs()));
+        shape * edge
     }
 
-    /// Lấy chỉ số nhiệt độ và độ ẩm
+    /// Độ cao bề mặt: đáy biển → bãi biển → đồng bằng → đồi → dãy núi, cộng hồ và sông.
+    /// Dãy núi tập trung ở hai cánh (tây lạnh, đông khô); quanh điểm xuất phát là đồng bằng.
+    #[inline]
+    pub fn get_surface_height(&self, wx: f64, wz: f64) -> usize {
+        let sea = self.sea_level as f64;
+        let half = WORLD_HALF as f64;
+        let nx = wx / half;
+        let r = (wx * wx + wz * wz).sqrt();
+        let land = self.island_value(wx, wz);
+
+        let hills = self.terrain_noise.get([wx * 0.006, wz * 0.006]);
+        let detail = self.detail_noise.get([wx * 0.05, wz * 0.05]);
+        let floor = sea - 9.0 + hills * 3.0;
+        let plains = sea + 5.0 + hills * 4.0 + detail * 0.8;
+
+        // Núi
+        let centre = smoothstep(120.0, 380.0, r);
+        let region = (self.mountain_noise.get([wx * 0.0017, wz * 0.0017]) + 1.0) * 0.5;
+        let west = smoothstep(0.1, 0.6, -nx);
+        let east = smoothstep(0.25, 0.7, nx);
+        let score = region + 0.28 * west + 0.12 * east;
+        let mw = smoothstep(0.52, 0.78, score) * centre * smoothstep(0.3, 0.7, land);
+        let ridge = 1.0 - self.ridge_noise.get([wx * 0.0055, wz * 0.0055]).abs();
+        let peaks = mw * (6.0 + 22.0 * ridge * ridge + detail * 2.0);
+        let mut h_land = plains + peaks;
+
+        // Hồ: lõm xuống dưới mực nước, tránh vùng núi và khu xuất phát
+        let lake = self.lake_noise.get([wx * 0.006, wz * 0.006]);
+        let basin = smoothstep(0.58, 0.74, lake)
+            * smoothstep(0.4, 0.7, land)
+            * (1.0 - mw)
+            * smoothstep(70.0, 160.0, r);
+        h_land += (sea - 4.0 - h_land) * basin;
+
+        // Sông: đường "không" của noise bị uốn, khoét thành rãnh; mờ dần ở vùng cao
+        let wxw = wx + self.river_warp.get([wx * 0.003, wz * 0.003]) * 45.0;
+        let wzw = wz + self.river_warp.get([wx * 0.003 + 31.7, wz * 0.003 - 12.9]) * 45.0;
+        let rv = self.river_noise.get([wxw * 0.0021, wzw * 0.0021]).abs();
+        let bed = 1.0 - smoothstep(0.004, 0.032, rv);
+        let gate = smoothstep(0.1, 0.35, land) * (1.0 - smoothstep(8.0, 26.0, h_land - sea));
+        h_land += (sea - 2.0 - h_land) * bed * gate;
+
+        // Bờ biển: nội suy từ đáy biển lên đất liền
+        let t = smoothstep(0.0, 0.32, land);
+        let h = floor + (h_land - floor) * t;
+        (h.floor() as isize).clamp(3, (CHUNK_SIZE_Y - 8) as isize) as usize
+    }
+
+    /// Lấy chỉ số nhiệt độ và độ ẩm (cùng thang 0..1). Nhiệt độ tăng dần từ tây (băng tuyết)
+    /// sang đông (sa mạc); độ ẩm giảm về phía đông. Noise chỉ làm lệch nhẹ để biên giới tự nhiên.
     #[inline]
     pub fn get_climate(&self, wx: f64, wz: f64) -> (f32, f32) {
-        let t = (self.temperature_noise.get([wx * 0.0015, wz * 0.0015]) as f32 + 1.0) * 0.5;
-        let h = (self.humidity_noise.get([wx * 0.0015, wz * 0.0015]) as f32 + 1.0) * 0.5;
-        (t.clamp(0.0, 1.0), h.clamp(0.0, 1.0))
+        let nx = (wx / WORLD_HALF as f64).clamp(-1.3, 1.3);
+        let tn = self.temperature_noise.get([wx * 0.003, wz * 0.003]);
+        let hn = self.humidity_noise.get([wx * 0.0025, wz * 0.0025]);
+        let t = 0.5 + 0.55 * nx + tn * 0.09;
+        let h = 0.62 - 0.45 * smoothstep(0.05, 0.75, nx) + hn * 0.2;
+        ((t as f32).clamp(0.0, 1.0), (h as f32).clamp(0.0, 1.0))
+    }
+
+    /// Tên vùng sinh thái tại một điểm (cho minimap / HUD). Khớp ngưỡng dùng khi sinh địa hình.
+    pub fn biome_label(&self, wx: f64, wz: f64) -> &'static str {
+        let h = self.get_surface_height(wx, wz);
+        if h <= self.sea_level {
+            return if self.island_value(wx, wz) > 0.45 { "Lake" } else { "Ocean" };
+        }
+        if h <= self.sea_level + 1 {
+            return "Coast";
+        }
+        let (t, hu) = self.get_climate(wx, wz);
+        if t < 0.28 || h >= 45 {
+            "Snow Mountains"
+        } else if t > 0.68 && hu < 0.35 {
+            "Desert"
+        } else if t > 0.58 && hu < 0.5 {
+            "Savanna"
+        } else if t < 0.38 {
+            "Taiga"
+        } else {
+            "Forest"
+        }
     }
 
     /// Hang động 3D ngầm
@@ -335,6 +435,7 @@ enum Ground {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Cactus`: xương rồng giờ do hệ thống sprite đảm nhiệm
 enum Species {
     Oak,
     BigOak,
@@ -344,6 +445,8 @@ enum Species {
     Pine,
     Dead,
     Cactus,
+    /// Cây cổ thụ khổng lồ (rất hiếm), tán rộng như trong rừng của Veloren.
+    Ancient,
 }
 
 #[inline]
@@ -400,7 +503,7 @@ impl WorldGenerator {
     fn pick_species(&self, ground: Ground, wx: f64, wz: f64, temp: f32, humid: f32, h: u32) -> Option<Species> {
         let r = h % 100;
         match ground {
-            Ground::Desert => Some(Species::Cactus),
+            Ground::Desert => None, // xương rồng do hệ thống sprite (glb) đảm nhiệm
             Ground::Snow => {
                 if r < 97 { Some(Species::Pine) } else { Some(Species::Dead) }
             }
@@ -412,6 +515,10 @@ impl WorldGenerator {
                 // Vùng lạnh mát: thông xen sồi
                 if temp < 0.38 {
                     return Some(if r < 60 { Species::Pine } else if r < 85 { Species::Birch } else { Species::Oak });
+                }
+                // Cổ thụ khổng lồ: rất hiếm, chỉ ở vùng rừng ẩm
+                if humid > 0.4 && (h >> 10) % 100 < 3 {
+                    return Some(Species::Ancient);
                 }
                 // Cụm loài thay đổi theo vùng (như "forest lottery" của Veloren)
                 let s = (self.species_noise.get([wx * 0.012, wz * 0.012]) as f32 + 1.0) * 0.5;
@@ -521,6 +628,11 @@ impl WorldGenerator {
                 trunk_len: 12.0 * scale, trunk_r: 1.8, child_len: 0.65, child_r: 0.6,
                 leaf_r: (2.4, 3.2), straight: 0.35, depth: 2, splits: (4.0, 6.0),
                 split_range: (0.7, 1.4), lvs: 0.9, wood: BlockType::Wood, leaf: BlockType::Leaves,
+            },
+            Species::Ancient => TreeCfg {
+                trunk_len: 17.0 * scale, trunk_r: 3.2, child_len: 0.58, child_r: 0.62,
+                leaf_r: (4.5, 6.0), straight: 0.3, depth: 2, splits: (4.0, 6.0),
+                split_range: (0.8, 1.5), lvs: 0.8, wood: BlockType::Wood, leaf: BlockType::Leaves,
             },
             Species::Birch => TreeCfg {
                 trunk_len: 10.5 * scale, trunk_r: 1.0, child_len: 0.55, child_r: 0.8,

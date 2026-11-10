@@ -18,13 +18,16 @@ use bevy::ui::FocusPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::biped::*;
+use redstoric_common::paths::data_path;
 use crate::{Character, WeaponHand};
 
 const APPEARANCE_PATH: &str = "character_appearance.json";
+/// Danh mục mảnh nhân vật dựng sẵn (dùng khi không quét được thư mục asset, ví dụ trên Android).
+const EMBEDDED_CATALOG: &str = include_str!("../../../assets_manifest/figure_catalog.json");
 const FIGURE_DIR: &str = "placeholders/glb/figure";
 
 /// Tỉ lệ voxel -> đơn vị thế giới. Nhân vật cao khoảng 19 voxel => ~1.6 đơn vị.
-const MODEL_SCALE: f32 = 0.085;
+pub const MODEL_SCALE: f32 = 0.085;
 
 // ---------------------------------------------------------------------------------------------
 // Dữ liệu
@@ -84,6 +87,10 @@ pub struct CharacterAppearance {
     pub beard: usize,
     pub eyes: usize,
     pub accessory: usize,
+    /// Chức nghiệp (chỉ số trong `weapons::WEAPONS`), chọn một lần khi vào game
+    pub class: usize,
+    /// Đã xác nhận chức nghiệp (khoá, không đổi nữa)
+    pub class_chosen: bool,
 }
 
 impl Default for CharacterAppearance {
@@ -95,12 +102,14 @@ impl Default for CharacterAppearance {
             beard: 0,
             eyes: 0,
             accessory: 0,
+            class: 0,
+            class_chosen: false,
         }
     }
 }
 
 fn load_appearance() -> CharacterAppearance {
-    std::fs::read_to_string(APPEARANCE_PATH)
+    std::fs::read_to_string(data_path(APPEARANCE_PATH))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
@@ -108,11 +117,11 @@ fn load_appearance() -> CharacterAppearance {
 
 fn save_appearance(appearance: &CharacterAppearance) {
     if let Ok(json) = serde_json::to_string_pretty(appearance) {
-        let _ = std::fs::write(APPEARANCE_PATH, json);
+        let _ = std::fs::write(data_path(APPEARANCE_PATH), json);
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct PartLists {
     hair: Vec<String>,
     beard: Vec<String>,
@@ -127,6 +136,28 @@ pub struct AppearanceCatalog {
 }
 
 impl AppearanceCatalog {
+    /// Ngoại hình ngẫu nhiên nhưng ổn định theo `seed`, dùng cho dân làng.
+    pub fn villager_appearance(&self, seed: u32) -> CharacterAppearance {
+        let mut r = seed | 1;
+        let mut next = |m: usize| -> usize {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            (r as usize) % m.max(1)
+        };
+        let species = match next(10) {
+            0 => Species::Elf,
+            1 => Species::Dwarf,
+            _ => Species::Human,
+        };
+        let female = next(2) == 0;
+        let lists = self.get(species, female);
+        let hair = next(lists.hair.len() + 1);
+        let beard = if !female && next(3) == 0 { next(lists.beard.len() + 1) } else { 0 };
+        let eyes = next(lists.eyes.len());
+        CharacterAppearance { species, female, hair, beard, eyes, accessory: 0, ..Default::default() }
+    }
+
     fn get(&self, species: Species, female: bool) -> PartLists {
         self.lists.get(&(species, female)).cloned().unwrap_or_default()
     }
@@ -167,12 +198,34 @@ fn find_figure_dir() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_dir())
 }
 
+/// Xuất danh mục quét từ đĩa thành JSON để nhúng vào bản Android (`assets_manifest/figure_catalog.json`).
+pub fn dump_catalog_json() -> String {
+    let catalog = scan_dir_catalog().unwrap_or_default();
+    let list: Vec<(Species, bool, PartLists)> =
+        catalog.lists.iter().map(|((s, f), l)| (*s, *f, l.clone())).collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn scan_catalog() -> AppearanceCatalog {
-    let mut catalog = AppearanceCatalog::default();
-    let Some(base) = find_figure_dir() else {
-        warn!("Không tìm thấy thư mục {FIGURE_DIR}; menu tạo nhân vật sẽ trống");
+    if let Some(catalog) = scan_dir_catalog() {
         return catalog;
-    };
+    }
+    // Không có thư mục asset trên đĩa: dùng danh mục dựng sẵn
+    let mut catalog = AppearanceCatalog::default();
+    if let Ok(list) = serde_json::from_str::<Vec<(Species, bool, PartLists)>>(EMBEDDED_CATALOG) {
+        for (s, f, l) in list {
+            catalog.lists.insert((s, f), l);
+        }
+    }
+    if catalog.lists.is_empty() {
+        warn!("Không tìm thấy thư mục {FIGURE_DIR} hay danh mục dựng sẵn; menu tạo nhân vật sẽ trống");
+    }
+    catalog
+}
+
+fn scan_dir_catalog() -> Option<AppearanceCatalog> {
+    let mut catalog = AppearanceCatalog::default();
+    let base = find_figure_dir()?;
 
     for species in Species::ALL {
         let dir = species.dir();
@@ -216,7 +269,7 @@ fn scan_catalog() -> AppearanceCatalog {
             catalog.lists.insert((species, female), lists);
         }
     }
-    catalog
+    Some(catalog)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -262,7 +315,19 @@ fn rebuild_humanoid(
     for entity in &old {
         commands.entity(entity).despawn();
     }
+    spawn_humanoid(&mut commands, player, &appearance, &catalog, &asset_server, true);
+}
 
+/// Dựng bộ model người dưới entity `parent`. `is_player` = true thì gắn `HumanoidRoot` (để bị
+/// dựng lại khi đổi ngoại hình) và cho cầm kiếm; dân làng (false) tay không và không bị động tới.
+pub fn spawn_humanoid(
+    commands: &mut Commands,
+    parent: Entity,
+    appearance: &CharacterAppearance,
+    catalog: &AppearanceCatalog,
+    asset_server: &AssetServer,
+    is_player: bool,
+) {
     let sex = if appearance.female { "female" } else { "male" };
     let lists = catalog.get(appearance.species, appearance.female);
     let load = |rel: String| {
@@ -283,15 +348,14 @@ fn rebuild_humanoid(
         .checked_sub(1)
         .and_then(|i| lists.accessory.get(i))
         .map(|p| load(format!("figure/{p}")));
-    let weapon = load("weapon/sword/caladbolg.glb".to_string());
+    let weapon = is_player.then(|| load("weapon/sword/caladbolg.glb".to_string()));
 
-    commands.entity(player).with_children(|root| {
-        root.spawn((
-            Transform::from_scale(Vec3::splat(MODEL_SCALE)),
-            Visibility::default(),
-            HumanoidRoot,
-        ))
-        .with_children(|body| {
+    commands.entity(parent).with_children(|root| {
+        let mut body_root = root.spawn((Transform::from_scale(Vec3::splat(MODEL_SCALE)), Visibility::default()));
+        if is_player {
+            body_root.insert(HumanoidRoot);
+        }
+        body_root.with_children(|body| {
             // Hông + thắt lưng (đứng yên theo thân)
             body.spawn((WorldAssetRoot(pants), Transform::from_xyz(0.0, layout::PANTS_Y, 0.0)));
             body.spawn((WorldAssetRoot(belt), Transform::from_xyz(0.0, layout::BELT_Y, 0.0)));
@@ -301,16 +365,16 @@ fn rebuild_humanoid(
             body.spawn((
                 Transform::from_xyz(-layout::FOOT_X, layout::HIP_Y, 0.0),
                 Visibility::default(),
-                BoneLegLeft,
             ))
+            .insert_if(BoneLegLeft, || is_player)
             .with_children(|leg| {
                 leg.spawn((WorldAssetRoot(foot.clone()), Transform::from_xyz(fx, fy, fz)));
             });
             body.spawn((
                 Transform::from_xyz(layout::FOOT_X, layout::HIP_Y, 0.0),
                 Visibility::default(),
-                BoneLegRight,
             ))
+            .insert_if(BoneLegRight, || is_player)
             .with_children(|leg| {
                 leg.spawn((WorldAssetRoot(foot), Transform::from_xyz(fx, fy, fz)));
             });
@@ -319,8 +383,8 @@ fn rebuild_humanoid(
             body.spawn((
                 Transform::from_xyz(0.0, layout::CHEST_Y, 0.0),
                 Visibility::default(),
-                BoneChest,
             ))
+            .insert_if(BoneChest, || is_player)
             .with_children(|c| {
                 c.spawn((WorldAssetRoot(chest), Transform::IDENTITY));
 
@@ -328,8 +392,8 @@ fn rebuild_humanoid(
                 c.spawn((
                     Transform::from_xyz(0.0, layout::HEAD_Y, 0.0),
                     Visibility::default(),
-                    BoneHead,
                 ))
+                .insert_if(BoneHead, || is_player)
                 .with_children(|h| {
                     h.spawn((WorldAssetRoot(head), Transform::IDENTITY));
                     if let Some(scene) = hair {
@@ -353,36 +417,38 @@ fn rebuild_humanoid(
                 c.spawn((
                     Transform::from_xyz(-layout::SHOULDER.0, layout::SHOULDER.1, 0.0),
                     Visibility::default(),
-                    BoneShoulderLeft,
                 ))
+                .insert_if(BoneShoulderLeft, || is_player)
                 .with_children(|sh| {
                     sh.spawn((
                         WorldAssetRoot(hand.clone()),
                         Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
-                        BoneHandLeft,
-                    ));
+                    ))
+                    .insert_if(BoneHandLeft, || is_player);
                 });
 
                 // Tay phải cầm kiếm
                 c.spawn((
                     Transform::from_xyz(layout::SHOULDER.0, layout::SHOULDER.1, 0.0),
                     Visibility::default(),
-                    BoneShoulderRight,
                 ))
+                .insert_if(BoneShoulderRight, || is_player)
                 .with_children(|sh| {
                     sh.spawn((
                         Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
                         Visibility::default(),
-                        BoneHandRight,
                     ))
+                    .insert_if(BoneHandRight, || is_player)
                     .with_children(|hand_node| {
                         hand_node.spawn((WorldAssetRoot(hand), Transform::IDENTITY));
-                        let (x, y, z) = layout::WEAPON;
-                        hand_node.spawn((
-                            WorldAssetRoot(weapon),
-                            Transform::from_xyz(x, y, z),
-                            WeaponHand,
-                        ));
+                        if let Some(weapon) = weapon {
+                            let (x, y, z) = layout::WEAPON;
+                            hand_node.spawn((
+                                WorldAssetRoot(weapon),
+                                Transform::from_xyz(x, y, z),
+                                WeaponHand,
+                            ));
+                        }
                     });
                 });
             });
@@ -409,6 +475,7 @@ struct CreatorRoot;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
+    Class,
     Species,
     Sex,
     Hair,
@@ -421,6 +488,7 @@ enum Field {
 enum CreatorAction {
     Step(Field, i32),
     Randomize,
+    Confirm,
     Close,
 }
 
@@ -431,9 +499,12 @@ pub struct CharacterCreatorPlugin;
 
 impl Plugin for CharacterCreatorPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(load_appearance())
+        let saved = load_appearance();
+        // Lần đầu vào game (chưa chọn chức nghiệp): tự mở menu
+        let open = !saved.class_chosen;
+        app.insert_resource(saved)
             .insert_resource(scan_catalog())
-            .init_resource::<CreatorMenu>()
+            .insert_resource(CreatorMenu { open })
             .add_systems(Startup, spawn_creator_menu)
             .add_systems(
                 Update,
@@ -503,8 +574,10 @@ fn spawn_creator_menu(mut commands: Commands) {
                 ))
                 .with_children(|panel| {
                     panel.spawn(menu_text("Character  [F7]", 22.0, Color::WHITE));
+                    panel.spawn(menu_text("Chon chuc nghiep (chi 1 lan) roi bam Confirm", 14.0, Color::srgb(1.0, 0.85, 0.4)));
 
                     for (name, field) in [
+                        ("Class", Field::Class),
                         ("Species", Field::Species),
                         ("Sex", Field::Sex),
                         ("Hair", Field::Hair),
@@ -555,14 +628,16 @@ fn spawn_creator_menu(mut commands: Commands) {
                         })
                         .with_children(|row| {
                             creator_button!(row, "Randomize", CreatorAction::Randomize);
+                            creator_button!(row, "Confirm", CreatorAction::Confirm);
                             creator_button!(row, "Close (F7)", CreatorAction::Close);
                         });
                 });
         });
 }
 
-fn toggle_creator(keys: Res<ButtonInput<KeyCode>>, mut menu: ResMut<CreatorMenu>) {
-    if keys.just_pressed(KeyCode::F7) {
+fn toggle_creator(keys: Res<ButtonInput<KeyCode>>, mut menu: ResMut<CreatorMenu>, appearance: Res<CharacterAppearance>) {
+    // Chưa chọn chức nghiệp thì menu không đóng được
+    if keys.just_pressed(KeyCode::F7) && appearance.class_chosen {
         menu.open = !menu.open;
     }
 }
@@ -586,6 +661,12 @@ fn step_field(app: &mut CharacterAppearance, catalog: &AppearanceCatalog, field:
         }
     };
     match field {
+        Field::Class => {
+            if !app.class_chosen {
+                let n = crate::weapons::WEAPONS.len() as i32;
+                app.class = (app.class as i32 + delta).rem_euclid(n) as usize;
+            }
+        }
         Field::Species => {
             let i = Species::ALL.iter().position(|s| *s == app.species).unwrap_or(0);
             let next = (i as i32 + delta).rem_euclid(Species::ALL.len() as i32) as usize;
@@ -645,7 +726,17 @@ fn handle_creator_buttons(
                 randomize(&mut next, &catalog);
                 appearance.set_if_neq(next);
             }
-            CreatorAction::Close => menu.open = false,
+            CreatorAction::Confirm => {
+                let mut next = appearance.clone();
+                next.class_chosen = true;
+                appearance.set_if_neq(next);
+                menu.open = false;
+            }
+            CreatorAction::Close => {
+                if appearance.class_chosen {
+                    menu.open = false;
+                }
+            }
         }
         save_appearance(&appearance);
     }
@@ -691,6 +782,10 @@ fn refresh_creator(
         };
         for (field, mut span) in &mut texts {
             **span = match field.0 {
+                Field::Class => {
+                    let name = crate::weapons::CLASS_LABELS[appearance.class.min(crate::weapons::WEAPONS.len() - 1)];
+                    if appearance.class_chosen { format!("{name} (locked)") } else { name.to_string() }
+                }
                 Field::Species => appearance.species.label().to_string(),
                 Field::Sex => (if appearance.female { "Female" } else { "Male" }).to_string(),
                 Field::Hair => optional(appearance.hair, lists.hair.len()),
