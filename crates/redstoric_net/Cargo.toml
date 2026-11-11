@@ -12,3 +12,5 @@ redstoric_common = { path = "../redstoric_common" }
 redstoric_core = { path = "../redstoric_core" }
 redstoric_voxel = { path = "../redstoric_voxel" }
 redstoric_combat_ai = { path = "../redstoric_combat_ai" }
+redstoric_store = { path = "../redstoric_store" }
+redstoric_protocol = { path = "../redstoric_protocol" }

@@ -53,3 +53,23 @@ pub mod fauna {
     /// Thời gian thể xác còn lại sau khi chết (giây).
     pub const DEATH_TIME: f32 = 1.8;
 }
+
+/// Chỉ số vũ khí mà server cần để kiểm tra đòn đánh (theo chức nghiệp).
+/// Bảng đầy đủ (mô hình, màu...) nằm ở `redstoric_core::weapons::WEAPONS`; test bên đó bảo đảm hai bảng khớp nhau.
+pub mod weapons {
+    #[derive(Clone, Copy, Debug)]
+    pub struct Stats {
+        pub duration: f32,
+        pub damage: f32,
+        pub range: f32,
+    }
+
+    pub const STATS: [Stats; 6] = [
+        Stats { duration: 0.35, damage: 25.0, range: 3.0 },
+        Stats { duration: 0.60, damage: 22.0, range: 3.3 },
+        Stats { duration: 0.85, damage: 45.0, range: 3.8 },
+        Stats { duration: 0.60, damage: 24.0, range: 55.0 },
+        Stats { duration: 0.75, damage: 32.0, range: 45.0 },
+        Stats { duration: 0.50, damage: 14.0, range: 40.0 },
+    ];
+}

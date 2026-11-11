@@ -466,3 +466,142 @@ cargo build --release --bin redstoric_server
 ```
 Mở cổng **UDP 6000** trên firewall. Chạy nền bằng systemd (`ExecStart=/opt/redstoric/redstoric_server`, `Restart=always`).
 Đã đồng bộ: class/vũ khí/đòn đánh, ngày đêm + thời tiết. Chưa: động vật, đặt/phá block (game chưa có tính năng phá/đặt block).
+
+## Bố cục thế giới (WorldPlan) và nhiệm vụ
+
+Thế giới không còn rải làng/boss ngẫu nhiên theo vùng. `crates/redstoric_common/src/worldplan.rs` lập bố cục một lần từ seed
+(tham khảo `world/src/civ` của Veloren):
+
+- **Thị trấn trung tâm** (`Site::id == 0`, bậc 0, chấm xanh lam trên minimap) nằm gần điểm xuất phát, an toàn.
+- **7 làng** (chấm vàng) cách nhau tối thiểu 260 khối; bậc 1-3 tăng theo khoảng cách tới thị trấn.
+- **9 dungeon/đấu trường boss** (chấm đỏ, tên `Dungeon LvN`) cách thị trấn >= 300 khối; bậc 1-5 càng xa càng khó.
+- Mỗi khu có `id` (SiteId) ổn định theo seed; server và client tự lập ra cùng bố cục. Dùng `WorldGenerator::plan_sites()` / `site_by_id()`.
+- Đổi số lượng/khoảng cách ở các hằng số đầu file `worldplan.rs`.
+
+Nhiệm vụ (`crates/redstoric_combat_ai/src/quest.rs`):
+
+- Đứng gần dân làng, bấm **Q** để nhận việc (mỗi lần một nhiệm vụ). Nhật ký ở góc trái màn hình.
+- **Hunt**: hạ N con thú quanh làng. **Courier**: tới một làng khác. **SlayBoss**: hạ boss ở một dungeon. Hoàn thành nhận xu.
+- Nhiệm vụ đầu tiên luôn là Hunt dễ. Tiến độ chỉ lưu trong phiên chơi.
+- Chưa có: Escort, đường nối giữa các khu, độ khó boss theo bậc, đồng bộ quest qua mạng.
+
+## Đa dạng boss và NPC
+
+- **Boss theo bậc dungeon** (`crates/redstoric_common/src/bosses.rs`, model trong `crates/redstoric_combat_ai/src/boss_models.rs`):
+  bậc 1 Obsidian Guardian (khối đen gốc), 2 Ogre Brute, 3 Minotaur Warlord hoặc Frost Yeti, 4 Mountain Troll, 5 Cyclops Titan.
+  Mỗi loại có hệ số riêng về máu, sát thương, tốc độ, tầm đánh, thời gian lấy đà, kích thước. Boss khổng lồ dựng từ các mảnh glb Veloren,
+  tay chân đảo khi đi, giơ tay lấy đà rồi bổ xuống. Server dùng cùng bảng chỉ số (chọn loại theo bậc đấu trường).
+  Thêm loài mới: sửa `SPECIES` trong `tools/gen_boss_models.py`, chạy `python tools/gen_boss_models.py`, rồi thêm biến thể vào `BossKind`.
+- **NPC dân làng** có 14 nghề (thêm Miner, Fisherman, Scholar, Priest, Bard, Village Elder), mỗi nghề có lời thoại và hàng bán riêng.
+  Thị trấn trung tâm luôn có 5 người, các làng 3-5 người, nghề chọn khác nhau theo từng làng.
+- **Trang phục NPC** (`crates/redstoric_core/src/outfits.rs`): mỗi nghề mặc bộ giáp/áo Veloren riêng (thợ rèn, đầu bếp, thương nhân, giáo sĩ, quý tộc...);
+  nghề có 2-3 bộ thì chọn theo hạt giống nên cùng nghề vẫn khác nhau. Thêm bộ mới: thêm một dòng vào `OUTFITS` và `options()`.
+
+## NPC: mau sac & di dao
+- Toc/da/ao moi dan lang duoc nhuom mau theo seed (`PartTint` + `apply_part_tints` trong `character_creator.rs`): 10 mau toc, 6 tong da, 8 mau ao.
+- Dan lang di dao quanh cho dung ban dau (ban kinh 6 block, `Wander` + `villager_wander` trong `npc.rs`); dung lai khi nguoi choi < 4.5 block hoac dang noi chuyen.
+
+## Nhiem vu theo nghe NPC (`combat_ai/src/quest.rs`)
+- Moi nghe co bo nhiem vu rieng (Farmer: diet tho/soi, nhat bi ngo; Blacksmith: quang sat, giao do, diet boss; Alchemist: hai thao duoc, nanh soi, do tham; Merchant; Guard: tuan tra, soi, boss; Innkeeper; Hunter; Cook; Miner; Fisherman; Scholar; Priest; Bard; Village Elder).
+- Loai: Hunt (theo loai thu), Fetch (nhat vat pham phat sang vang), Patrol (cham 3 cot moc xanh quanh lang), Scout (toi gan dungeon), Courier (toi lang khac, xong ngay), SlayBoss.
+- Q gan dan lang: nhan viec; xong muc tieu thi quay ve dung nguoi do bam Q de tra. X hai lan: bo viec.
+- Thuong: xu + 1 mon hang cua nghe nguoi giao. Uy tin lang +1 moi lan tra (thuong +10%/diem); tu 2 uy tin lang moi giao viec diet boss (Guard/Elder giao luon).
+
+## Dan lang tu ve (`combat_ai/src/villager_fight.rs`)
+- Dan lang di khap lang (65% chon diem bat ky trong ban kinh lang, con lai quanh cho dung).
+- Danh/ban trung mot dan lang: moi dan lang trong 70 block noi gian, rut vu khi rieng theo nghe (`npc::combat_profile`) va danh lai. Guard riu, Noble kiem, Blacksmith bua, Farmer chia, Miner cuoc, Fisherman giao, Cook dui ga, Innkeeper choi, Merchant dao gam, Bard dan lute; Hunter ban ten, Alchemist/Scholar cau lua, Priest tia thanh.
+- Chay xa > 45 block trong 10 giay (hoac keo ho xa nha > 60 block) thi ho nguoi gian, cat vu khi, hoi day mau. Bi ha thi nga va bien mat (tai lai chunk se sinh lai).
+- Moi lan lam ca lang noi gian: -1 uy tin nhiem vu; dan lang dang gian khong noi chuyen / giao viec.
+
+## Hoat anh chung + nghieng + lan (`core/src/biped.rs`)
+- `Limb` gan cho moi khop cua ca nguoi choi lan NPC; `AnimDriver` tren entity goc tinh toc do/huong tu chuyen dong that, nen NPC chay/di giong nguoi choi (NPC nhanh > 3 khoi/s dung hoat anh chay nuoc rut).
+- Nghieng nguoi khi re trai/phai (theo toc do xoay huong, nhu `tilt` trong `run.rs` cua Veloren); dau nhin theo huong re.
+- Bam Shift: lan (0.5 s, xoay than 1 vong nhu `roll.rs` cua Veloren), giu Shift sau do de chay nuoc rut. Dang lan thi ne duoc don cua boss, soi va dan lang (i-frame).
+
+## Nha kieu Veloren (`common/src/structures.rs::build_house`)
+- Tham khao `world/src/site/plot/house.rs`: mong da, khung dam go sam (`DarkWood`) + tuong trat vua (`Plaster`), cua so co bau da, khung cua, mai hai doc 45 do day 2 lop chia mai 1 o, dau hoi trat vua, ong khoi da.
+- Nha rong co 1/3 co hoi 2 tang: tang duoi xay da, tang tren dua ra 1 o voi dam san lo ra.
+- Mau mai ngau nhien: ngoi do / xanh duong / xanh la / rom (`RoofTile`, `RoofTileBlue`, `RoofTileGreen`, `Thatch`). Kich thuoc 7-11 x 7-9.
+
+## Lang an toan + dan lang bao ve (`fauna/mod.rs`, `villager_fight.rs`)
+- Thu du (Alignment::Enemy, vd soi) khong sinh trong lang va bi chan o ria lang (ban kinh 46 tu tam); con nao dang o trong chi duoc di ra.
+- Thu du lot vao gan (22 khoi, trong 55 khoi quanh cho dung) thi dan lang rut vu khi danh (`Defending`), ho cau thoai: "Hang on, let me give you a hand!" khi nguoi choi o gan, hoac cau rieng theo nghe ("For the village!", "Off my fields, you mongrel!"...). Ha xong: "Thanks for the help, friend!".
+- Bong bong thoai tren dau (`Speech`), cung dung khi dan lang noi gian / nguoi gian.
+
+## Cau truc lich chay + hieu nang
+- `redstoric_core::GameSet`: moi khung hinh chay theo thu tu Net -> Input -> Sim -> Anim -> Ui. Input/Sim/Anim chi chay khi the gioi da tai xong (`world_ready`).
+- Material nhuom mau NPC dung chung theo (material goc, mau) -> it material hon, GPU gop lenh ve tot hon.
+- NPC xa hon 70 khoi khong chay hoat anh; quest HUD dung lai chu 10 lan/giay; danh sach lang cho AI thu lam moi moi giay.
+
+## Chat (`net/src/chat.rs`)
+- Enter mo o chat, go, Enter gui, Esc huy. Chi nhan ky tu ASCII (tieng Anh), toi da 120 ky tu, server gioi han 2 tin/giay.
+- Online: `ClientMsg::Chat` -> server -> `ServerMsg::Chat` cho moi nguoi. Offline: hien cuc bo. PROTOCOL_VERSION = 3 (phai build lai ca server).
+
+## Giong noi NPC (TTS)
+- `python tools/export_voice_lines.py` tao `assets/audio/voice/voice_lines.csv` (id, nguoi noi, loai, cau can doc).
+- Dat file vao `assets/audio/voice/m/<id>.ogg` (giong nam) va/hoac `assets/audio/voice/f/<id>.ogg` (giong nu); nhan .ogg / .wav / .mp3. Thieu file thi NPC chi hien chu.
+- Game phat khi: noi chuyen (E), giao / tra nhiem vu (Q), bong bong thoai khi danh nhau. Am luong giam theo khoang cach (28 khoi). Code: `core/src/voice.rs`, `src/audio.rs::npc_voice_system`.
+- Sua cau thoai trong code thi id doi: chay lai script va thu lai cau do.
+
+## Giong NPC theo do tuoi (Kokoro)
+- Moi dan lang co do tuoi (`npc::age_of`: tre / trung nien / gia; Village Elder luon gia, nguoi gia toc bac).
+- `pip install kokoro soundfile` roi `python tools/make_npc_voices.py` tao `assets/audio/voice/<m|f>_<young|adult|old>/<id>.ogg`. Bang giong + toc do doc o dau script (`VOICES`).
+- Game chon dung gioi + tuoi; thieu thi lay tuoi gan nhat, roi thu muc `m`/`f` cu, roi gioi con lai.
+
+
+## Chạy test
+
+```
+cargo test --workspace            # toàn bộ
+cargo test -p redstoric_common    # sinh thế giới, WorldPlan (nhanh, không cần Bevy đầy đủ)
+cargo test -p redstoric_core voice
+```
+
+* Nhóm test chính: sinh thế giới theo seed (cùng seed phải ra cùng kết quả), bố cục `WorldPlan` (khoảng cách,
+  bậc độ khó), `voice_id`, mẫu nhiệm vụ, câu thoại dân làng, lọc tin nhắn chat và tên người chơi phía server.
+* Các test đối chiếu `assets/audio/voice/voice_lines.csv` (id giọng nói khớp với Rust) tự bỏ qua nếu file đó
+  không có (thư mục `assets/` nằm trong `.gitignore`). Khi thêm hoặc sửa câu thoại mà test báo thiếu id, chạy lại
+  `python tools/export_voice_lines.py`.
+* File backup dạng `*.bak_<tên>` đã được thêm vào `.gitignore`.
+
+
+## Tách mô phỏng (Sim) và giao diện (Ui)
+
+Bước đầu của việc đưa logic game ra khỏi phần hiển thị, để sau này server chạy được không cần cửa sổ/GPU.
+
+* `redstoric_combat_ai`: `CombatAiPlugin` = `CombatAiSimPlugin` (AI thú/boss/dân làng, nhiệm vụ, đạn, sát thương;
+  trong `GameSet::Sim`) + `CombatAiUiPlugin` (thanh máu, hotbar, bảng nhiệm vụ, bong bóng thoại; trong `GameSet::Ui`,
+  chỉ chạy khi thế giới đã tải xong).
+* `redstoric_core::npc`: `NpcPlugin` = `NpcSimPlugin` (sinh dân làng, đi lại, hội thoại) + `NpcUiPlugin` (bảng hội thoại,
+  bảng tên, đọc thoại thành tiếng).
+* Module đã chia nhỏ: `quest/{templates,helpers,sim,markers,ui}.rs`, `villager_fight/{sim,speech}.rs`,
+  `npc/{sim,ui}.rs`. Tên đường dẫn công khai (`quest::QuestLog`, `npc::Villager`...) giữ nguyên.
+* Bước tiếp theo: bỏ phụ thuộc đồ họa trong các file `sim` (mesh/vật liệu của cột mốc nhiệm vụ, đạn) rồi tách thành
+  crate `redstoric_sim`.
+
+## Lưu trữ và tài khoản (server)
+
+- Client tự sinh khoá bí mật trong `account_key.txt` (cạnh file chạy; **nhớ sao lưu**, mất là mất nhân vật). Server chỉ lưu `sha256(khoá)`.
+- Server ghi dữ liệu vào thư mục `server_data/` (đổi bằng `--data <thư mục>`): `players/<mã>.json` cho từng nhân vật (vị trí, chức nghiệp, máu, ngoại hình, tiến độ) và `world.json` (boss đã hạ, giờ trong ngày). Ghi nguyên tử; tự lưu mỗi 30 giây, khi người chơi thoát và khi boss bị hạ.
+- Tiến độ (ví, túi đồ, uy tín, dungeon đã hạ) do client gửi lên và server chưa kiểm chứng: người sửa client có thể gian lận. Bước sau là để server quyết định phần thưởng.
+- Giao thức lên v4: client và server cũ không vào được nhau. Test: `cargo test -p redstoric_store`.
+
+## Chạy server riêng (kể cả trên điện thoại)
+
+Server là crate độc lập `redstoric_server` (+ `redstoric_protocol`, `redstoric_store`), **không** phụ thuộc đồ hoạ/âm thanh/cửa sổ (~200 crate, không có wgpu/winit), nên build được trên Termux (Android).
+
+```bash
+# Trên máy tính / VPS
+cargo run --release -p redstoric_server -- --port 6000 --data server_data
+
+# Trên điện thoại (Termux, cài từ F-Droid)
+pkg update && pkg install rust clang git
+git clone <repo của bạn> Redstoric && cd Redstoric
+cargo build --release -p redstoric_server        # lần đầu ~15-30 phút
+termux-wake-lock                                  # giữ máy khỏi ngủ
+./target/release/redstoric_server --port 6000 --data ~/server_data
+```
+
+Client cùng Wi-Fi: `Redstoric --connect <IP điện thoại>:6000 --name Tam` (xem IP bằng `ip addr` / `ifconfig` trong Termux).
+Chơi qua Internet: dùng Tailscale (cài trên cả hai máy) thay vì mở cổng, vì mạng di động thường dùng CGNAT. Cổng là **UDP** 6000.
+Android có thể giết tiến trình nền: tắt tối ưu pin cho Termux. Dữ liệu tự lưu mỗi 30 giây nên bị giết cũng chỉ mất tối đa 30 giây.

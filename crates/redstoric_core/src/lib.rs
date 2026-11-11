@@ -7,6 +7,8 @@ pub mod graphics;
 pub mod graphics_menu;
 pub mod minimap;
 pub mod npc;
+pub mod voice;
+pub mod outfits;
 pub mod voxel_material;
 pub mod weather;
 pub mod weapons;
@@ -15,26 +17,48 @@ use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 use redstoric_voxel::VoxelWorldMap;
 pub use character_visual::{CharacterModelRoot, clean_character_glb_hierarchy, character_procedural_animation};
-use crate::biped::biped_walk_animation_system;
+use crate::biped::biped_animation_system;
 
 pub struct CorePlugin;
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((npc::NpcPlugin, daynight::DayNightPlugin, weather::WeatherPlugin, weapons::WeaponPlugin)).add_systems(
-            Update,
-            (
-                character_controller,
-                orbit_camera_system,
-                clean_character_glb_hierarchy,
-                character_procedural_animation,
-                biped_walk_animation_system,
-                sprint_fov_system
-            )
-                // Chờ thế giới tải xong để nhân vật không rơi xuyên địa hình chưa có
-                .run_if(redstoric_voxel::preload::world_ready),
-        );
+        use redstoric_voxel::preload::world_ready;
+        app.init_resource::<ChatFocus>()
+            .init_resource::<voice::VoiceQueue>()
+            // Khung lịch chung của cả game: Net -> Input -> Sim -> Anim -> Ui (mỗi khung hình chạy đúng thứ tự này).
+            .configure_sets(Update, (GameSet::Net, GameSet::Input, GameSet::Sim, GameSet::Anim, GameSet::Ui).chain())
+            // Chờ thế giới tải xong: không chạy điều khiển / AI / hoạt ảnh trong lúc màn hình tải
+            .configure_sets(Update, GameSet::Input.run_if(world_ready))
+            .configure_sets(Update, GameSet::Sim.run_if(world_ready))
+            .configure_sets(Update, GameSet::Anim.run_if(world_ready))
+            .add_plugins((npc::NpcPlugin, daynight::DayNightPlugin, weather::WeatherPlugin, weapons::WeaponPlugin))
+            .add_systems(Update, (character_controller, sprint_fov_system).in_set(GameSet::Input))
+            .add_systems(
+                Update,
+                (orbit_camera_system, clean_character_glb_hierarchy, biped_animation_system).in_set(GameSet::Anim),
+            );
     }
 }
+
+/// Các pha của một khung hình. Mọi plugin gắn system của mình vào một pha để thứ tự chạy rõ ràng
+/// (không còn phụ thuộc thứ tự ngẫu nhiên giữa các crate) và để tắt cả pha bằng một run condition.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GameSet {
+    /// Nhận / gửi gói mạng
+    Net,
+    /// Điều khiển của người chơi
+    Input,
+    /// Mô phỏng: AI, chiến đấu, nhiệm vụ, NPC
+    Sim,
+    /// Hoạt ảnh và camera (sau khi mọi thứ đã di chuyển)
+    Anim,
+    /// Giao diện
+    Ui,
+}
+
+/// Đang gõ chat: phím bấm không được điều khiển nhân vật (bàn phím bị xoá ở `PreUpdate`).
+#[derive(Resource, Default)]
+pub struct ChatFocus(pub bool);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActionState {
@@ -46,6 +70,8 @@ pub enum ActionState {
     Falling,
     Climbing,
     Swimming,
+    /// Lăn né (Shift), như `Roll` của Veloren
+    Rolling,
     Attacking(u8),
 }
 
@@ -68,6 +94,21 @@ pub struct Character {
     pub climb_stamina: f32,
     /// Đang nhấc người lên một bậc
     pub stepping: bool,
+    /// Thời gian lăn còn lại (giây); > 0 là đang lăn
+    pub roll_timer: f32,
+    pub roll_dir: Vec3,
+    /// Hồi chiêu lăn
+    pub roll_cd: f32,
+}
+
+impl Character {
+    pub fn rolling(&self) -> bool {
+        self.roll_timer > 0.0
+    }
+    /// Tiến độ lăn 0..1
+    pub fn roll_progress(&self) -> f32 {
+        (1.0 - self.roll_timer / ROLL_TIME).clamp(0.0, 1.0)
+    }
 }
 
 impl Default for Character {
@@ -84,6 +125,9 @@ impl Default for Character {
             land_timer: 0.0,
             climb_stamina: CLIMB_STAMINA,
             stepping: false,
+            roll_timer: 0.0,
+            roll_dir: Vec3::NEG_Z,
+            roll_cd: 0.0,
         }
     }
 }
@@ -128,6 +172,11 @@ const CLIMB_STAMINA: f32 = 3.5;
 const COYOTE_TIME: f32 = 0.12;
 /// Tốc độ nhấc người lên khi bước lên bậc (khối/giây), thay cho việc dịch chuyển tức thời
 const STEP_RATE: f32 = 6.0;
+/// Thời gian một cú lăn (giây) và hồi chiêu sau khi lăn xong
+pub const ROLL_TIME: f32 = 0.5;
+const ROLL_COOLDOWN: f32 = 0.35;
+/// Tốc độ lăn lúc đầu (khối/giây), giảm dần về cuối cú lăn
+const ROLL_SPEED: f32 = 13.0;
 
 pub fn character_controller(
     time: Res<Time>,
@@ -179,7 +228,30 @@ pub fn character_controller(
 
         let was_grounded = character.is_grounded;
         let sprint_key = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
-        character.sprinting = sprint_key && moving && !in_water;
+        // Bấm Shift: lăn (theo hướng đang đi, đứng yên thì lăn về phía trước). Giữ Shift sau đó: chạy nước rút
+        if character.roll_cd > 0.0 {
+            character.roll_cd -= dt;
+        }
+        let shift_tap = keyboard.just_pressed(KeyCode::ShiftLeft) || keyboard.just_pressed(KeyCode::ShiftRight);
+        if shift_tap
+            && !character.rolling()
+            && character.roll_cd <= 0.0
+            && character.is_grounded
+            && !in_water
+            && character.attack_timer <= 0.0
+        {
+            let fwd = transform.forward();
+            character.roll_dir = if moving { direction } else { Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::NEG_Z) };
+            character.roll_timer = ROLL_TIME;
+            character.roll_cd = ROLL_TIME + ROLL_COOLDOWN;
+        }
+        let rolling = character.rolling();
+        let roll_k = character.roll_progress();
+        if rolling {
+            character.roll_timer -= dt;
+        }
+        character.sprinting = sprint_key && moving && !in_water && !rolling;
+        let (moving, direction) = if rolling { (true, character.roll_dir) } else { (moving, direction) };
         if character.land_timer > 0.0 {
             character.land_timer -= dt;
         }
@@ -191,7 +263,7 @@ pub fn character_controller(
             character.air_time += dt;
         }
         let can_jump = character.is_grounded || (character.air_time < COYOTE_TIME && character.velocity_y <= 0.0);
-        if keyboard.just_pressed(KeyCode::Space) && can_jump && !in_water {
+        if keyboard.just_pressed(KeyCode::Space) && can_jump && !in_water && !rolling {
             character.velocity_y = JUMP_FORCE;
             character.is_grounded = false;
             character.air_time = COYOTE_TIME;
@@ -249,6 +321,9 @@ pub fn character_controller(
             if in_water {
                 speed *= SWIM_MULT;
             }
+            if rolling {
+                speed = ROLL_SPEED * (1.0 - 0.55 * roll_k);
+            }
             let next_x = transform.translation.x + direction.x * speed * dt;
             let next_z = transform.translation.z + direction.z * speed * dt;
 
@@ -263,7 +338,7 @@ pub fn character_controller(
                     if next_ground > transform.translation.y && next_ground - transform.translation.y <= 0.3 {
                         transform.translation.y = next_ground;
                     }
-                } else if !in_water && character.climb_stamina > 0.0 {
+                } else if !in_water && !rolling && character.climb_stamina > 0.0 {
                     // Bám vách và leo lên: không rơi, đi lên với tốc độ cố định
                     climbing = true;
                     character.velocity_y = 0.0;
@@ -282,7 +357,9 @@ pub fn character_controller(
 
         // 6. Trạng thái hoạt ảnh (đòn đánh có ưu tiên riêng)
         if character.attack_timer <= 0.0 {
-            character.state = if in_water {
+            character.state = if rolling {
+                ActionState::Rolling
+            } else if in_water {
                 ActionState::Swimming
             } else if climbing {
                 ActionState::Climbing

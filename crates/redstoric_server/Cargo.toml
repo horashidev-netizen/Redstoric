@@ -1,0 +1,21 @@
+[package]
+name = "redstoric_server"
+version = "0.1.0"
+edition = "2024"
+description = "Server chuyên dụng của Redstoric: không cửa sổ, không GPU, chạy được trên Linux/Windows/Termux (Android)."
+
+[lib]
+name = "redstoric_server"
+
+[[bin]]
+name = "redstoric_server"
+path = "src/main.rs"
+
+[dependencies]
+# Chỉ phần lõi của Bevy (ECS, app, thời gian, log), không có đồ hoạ / âm thanh / cửa sổ.
+bevy = { version = "0.20.1", default-features = false, features = ["bevy_log"] }
+bevy_quinnet = { workspace = true }
+serde_json = { workspace = true }
+redstoric_common = { path = "../redstoric_common" }
+redstoric_protocol = { path = "../redstoric_protocol" }
+redstoric_store = { path = "../redstoric_store" }

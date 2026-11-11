@@ -5,6 +5,9 @@ members = [
     "crates/redstoric_voxel",
     "crates/redstoric_combat_ai",
     "crates/redstoric_net",
+    "crates/redstoric_store",
+    "crates/redstoric_protocol",
+    "crates/redstoric_server",
 ]
 resolver = "2"
 
@@ -26,6 +29,8 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "bevy_sprite",
     "bevy_audio",
     "vorbis",
+    "wav",
+    "mp3",
     "bevy_gilrs",
     "png",
     "hdr",

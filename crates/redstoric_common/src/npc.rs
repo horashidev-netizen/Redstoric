@@ -14,6 +14,12 @@ pub enum Profession {
     Innkeeper,
     Hunter,
     Cook,
+    Miner,
+    Fisherman,
+    Scholar,
+    Priest,
+    Bard,
+    Noble,
 }
 
 /// Một món hàng trong cửa hàng của NPC.
@@ -24,7 +30,7 @@ pub struct Good {
 }
 
 impl Profession {
-    pub const ALL: [Profession; 8] = [
+    pub const ALL: [Profession; 14] = [
         Profession::Farmer,
         Profession::Blacksmith,
         Profession::Alchemist,
@@ -33,6 +39,12 @@ impl Profession {
         Profession::Innkeeper,
         Profession::Hunter,
         Profession::Cook,
+        Profession::Miner,
+        Profession::Fisherman,
+        Profession::Scholar,
+        Profession::Priest,
+        Profession::Bard,
+        Profession::Noble,
     ];
 
     pub fn from_index(i: u8) -> Self {
@@ -53,6 +65,12 @@ impl Profession {
             Profession::Innkeeper => "Innkeeper",
             Profession::Hunter => "Hunter",
             Profession::Cook => "Cook",
+            Profession::Miner => "Miner",
+            Profession::Fisherman => "Fisherman",
+            Profession::Scholar => "Scholar",
+            Profession::Priest => "Priest",
+            Profession::Bard => "Bard",
+            Profession::Noble => "Village Elder",
         }
     }
 
@@ -98,6 +116,36 @@ impl Profession {
                 "Something smells good, does it not? Stew of the day, fresh from the pot.",
                 "A full belly makes a brave heart. Eat before you fight.",
                 "The secret is patience. And a pinch of something I will not tell you.",
+            ],
+            Profession::Miner => &[
+                "Dust in my lungs and gold in my dreams. That is a miner's life.",
+                "The deep tunnels groan at night. Something big is moving down there.",
+                "Bring me a good pickaxe and I will show you where the ore runs thick.",
+            ],
+            Profession::Fisherman => &[
+                "The lake is calm today. The fish are not, they know I am coming.",
+                "Piranhas have moved into the rivers. Mind your toes when you cross.",
+                "Patience, friend. A line in the water and a quiet mind - that is the whole secret.",
+            ],
+            Profession::Scholar => &[
+                "Fascinating! The old arenas were built long before our villages. Nobody knows by whom.",
+                "The guardians grow stronger the farther they stand from the town. I have charted it.",
+                "Knowledge is the sharpest blade. Though a real blade helps too.",
+            ],
+            Profession::Priest => &[
+                "Peace be with you, traveller. The road ahead is long and the nights are cold.",
+                "Light a candle for those who never came back from the dungeons.",
+                "Come to me when you are wounded. Bodies heal faster than regrets.",
+            ],
+            Profession::Bard => &[
+                "Ah, an adventurer! Stand still a moment, you will be in my next song.",
+                "I sing of the Ogre who cried, the Minotaur's maze and the Cyclops who lost his glasses.",
+                "Every village has a story. Ask around, someone always needs a hero.",
+            ],
+            Profession::Noble => &[
+                "Welcome to our humble village. I am its elder, though the title is mostly paperwork.",
+                "We need brave people. Speak to anyone here and press Q, there is always work to be done.",
+                "The farther dungeons hide greater beasts and greater rewards. Choose your fights with care.",
             ],
         }
     }
@@ -152,6 +200,42 @@ impl Profession {
                 Good { name: "Fresh bread", price: 4 },
                 Good { name: "Apple pie", price: 12 },
                 Good { name: "Spice jar", price: 14 },
+            ],
+            Profession::Miner => &[
+                Good { name: "Pickaxe", price: 40 },
+                Good { name: "Coal", price: 5 },
+                Good { name: "Raw ore", price: 12 },
+                Good { name: "Miner's lamp", price: 22 },
+            ],
+            Profession::Fisherman => &[
+                Good { name: "Fishing rod", price: 25 },
+                Good { name: "Fresh fish", price: 6 },
+                Good { name: "Bait tin", price: 3 },
+                Good { name: "Fishing net", price: 30 },
+            ],
+            Profession::Scholar => &[
+                Good { name: "Old map", price: 35 },
+                Good { name: "Spell scroll", price: 45 },
+                Good { name: "Ink bottle", price: 6 },
+                Good { name: "Field guide", price: 20 },
+            ],
+            Profession::Priest => &[
+                Good { name: "Blessed water", price: 18 },
+                Good { name: "Prayer candle", price: 4 },
+                Good { name: "Holy charm", price: 50 },
+                Good { name: "Bandages", price: 9 },
+            ],
+            Profession::Bard => &[
+                Good { name: "Wooden flute", price: 28 },
+                Good { name: "Song sheet", price: 7 },
+                Good { name: "Lute string", price: 5 },
+                Good { name: "Festival hat", price: 15 },
+            ],
+            Profession::Noble => &[
+                Good { name: "Silk cloak", price: 80 },
+                Good { name: "Village banner", price: 25 },
+                Good { name: "Signet ring", price: 120 },
+                Good { name: "Fine wine", price: 35 },
             ],
         }
     }

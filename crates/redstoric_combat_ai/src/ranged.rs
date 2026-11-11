@@ -22,12 +22,12 @@ pub enum ProjKind {
 #[derive(Component)]
 pub struct Projectile {
     pub kind: ProjKind,
-    vel: Vec3,
+    pub(crate) vel: Vec3,
     gravity: f32,
-    damage: f32,
+    pub(crate) damage: f32,
     life: f32,
     /// Đạn chỉ để hiển thị (của người chơi khác): không gây sát thương, không hồi máu
-    visual: bool,
+    pub(crate) visual: bool,
 }
 
 /// Hiệu ứng/đạn do mạng báo về, không gửi ngược lên server.

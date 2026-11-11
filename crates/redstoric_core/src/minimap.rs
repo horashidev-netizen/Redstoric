@@ -303,6 +303,11 @@ fn block_rgb(b: BlockType) -> [f32; 3] {
         BlockType::Farmland => [0.30, 0.19, 0.11],
         BlockType::Wheat => [0.85, 0.72, 0.22],
         BlockType::Rice => [0.55, 0.80, 0.30],
+        BlockType::Plaster => [0.86, 0.80, 0.68],
+        BlockType::DarkWood => [0.24, 0.15, 0.08],
+        BlockType::RoofTileBlue => [0.22, 0.32, 0.50],
+        BlockType::RoofTileGreen => [0.26, 0.42, 0.24],
+        BlockType::Thatch => [0.72, 0.58, 0.30],
         BlockType::Air => [0.0, 0.0, 0.0],
     }
 }
@@ -367,7 +372,7 @@ fn update_minimap_image(
         }
     }
 
-    // Biểu tượng các khu công trình: làng (vàng), đấu trường boss (đỏ). Ở xa thì bám theo rìa bản đồ.
+    // Biểu tượng các khu công trình: thị trấn (xanh lam), làng (vàng), đấu trường boss (đỏ). Ở xa thì bám theo rìa bản đồ.
     if let Some(generator) = generator {
         let reach = 400;
         let (ox, oz) = (origin.x as i32, origin.z as i32);
@@ -378,6 +383,7 @@ fn update_minimap_image(
             let px = (half + d.dot(right) / step).clamp(margin, limit) as i32;
             let py = (half - d.dot(forward) / step).clamp(margin, limit) as i32;
             let color = match site.kind {
+                SiteKind::Village if site.tier == 0 => [90u8, 200, 255, 255],
                 SiteKind::Village => [255u8, 205, 40, 255],
                 SiteKind::BossArena => [235u8, 40, 40, 255],
             };

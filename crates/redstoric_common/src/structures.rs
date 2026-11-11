@@ -21,7 +21,6 @@ pub const REGION: i32 = 192;
 const MARGIN: i32 = 56;
 /// Bề rộng dải chuyển tiếp địa hình ngoài bán kính khu.
 pub const BLEND: i32 = 6;
-const MAX_FOOTPRINT: i32 = 52;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SiteKind {
@@ -39,14 +38,19 @@ pub struct Site {
     /// Bán kính vùng phẳng.
     pub radius: i32,
     pub seed: u32,
+    /// Chỉ số của khu trong `WorldPlan` (SiteId, ổn định theo seed). Nhiệm vụ tham chiếu khu bằng số này.
+    pub id: u32,
+    /// Bậc độ khó: 0 = thị trấn trung tâm (an toàn), 1..=5 càng xa trung tâm càng khó.
+    pub tier: u8,
 }
 
 impl Site {
     /// Tên hiển thị của khu (làng có tên riêng sinh từ hạt giống).
     pub fn name(&self) -> String {
         match self.kind {
+            SiteKind::Village if self.tier == 0 => format!("{} Town", crate::npc::village_name(self.seed)),
             SiteKind::Village => crate::npc::village_name(self.seed),
-            SiteKind::BossArena => "Boss Arena".to_string(),
+            SiteKind::BossArena => format!("Dungeon Lv{}", self.tier),
         }
     }
 
@@ -108,17 +112,9 @@ fn set_world(chunk: &mut ChunkData, ox: i32, oz: i32, wx: i32, wy: i32, wz: i32,
 }
 
 impl WorldGenerator {
-    /// Khu của một vùng (nếu có).
-    pub fn site_for_region(&self, rx: i32, rz: i32) -> Option<Site> {
-        let h = hash2(rx, rz, 901);
-        let kind = match h % 100 {
-            0..=37 => SiteKind::Village,
-            38..=57 => SiteKind::BossArena,
-            _ => return None,
-        };
-        let span = (REGION - 2 * MARGIN) as u32;
-        let x = rx * REGION + MARGIN + ((h >> 8) % span) as i32;
-        let z = rz * REGION + MARGIN + ((h >> 16) % span) as i32;
+    /// Kiểm tra địa hình quanh `(x, z)` có đủ khô và bằng phẳng để đặt một khu loại `kind` không;
+    /// nếu có thì trả về `Site` (đã gán `id`, `tier`). Dùng bởi `WorldPlan` khi lập bố cục thế giới.
+    pub(crate) fn make_site(&self, kind: SiteKind, x: i32, z: i32, id: u32, tier: u8) -> Option<Site> {
         let radius = match kind {
             SiteKind::Village => 44,
             SiteKind::BossArena => 24,
@@ -155,24 +151,26 @@ impl WorldGenerator {
             return None;
         }
 
-        Some(Site { kind, x, z, base_y, radius, seed: hash2(rx, rz, 77) | 1 })
+        Some(Site { kind, x, z, base_y, radius, seed: hash2(id as i32, 31, 77) | 1, id, tier })
+    }
+
+    /// Toàn bộ khu của thế giới theo `WorldPlan` (chỉ số trong slice = `Site::id`).
+    pub fn plan_sites(&self) -> &[Site] {
+        &self.plan
+    }
+
+    /// Tra khu theo `SiteId`.
+    pub fn site_by_id(&self, id: u32) -> Option<&Site> {
+        self.plan.get(id as usize)
     }
 
     /// Các khu có phần (kể cả dải chuyển tiếp) chạm vào hình chữ nhật cho trước.
     pub fn sites_in_area(&self, min_x: i32, min_z: i32, max_x: i32, max_z: i32) -> Vec<Site> {
-        let r0x = (min_x - MAX_FOOTPRINT).div_euclid(REGION);
-        let r1x = (max_x + MAX_FOOTPRINT).div_euclid(REGION);
-        let r0z = (min_z - MAX_FOOTPRINT).div_euclid(REGION);
-        let r1z = (max_z + MAX_FOOTPRINT).div_euclid(REGION);
         let mut out = Vec::new();
-        for rx in r0x..=r1x {
-            for rz in r0z..=r1z {
-                if let Some(s) = self.site_for_region(rx, rz) {
-                    let f = s.radius + BLEND;
-                    if s.x + f >= min_x && s.x - f <= max_x && s.z + f >= min_z && s.z - f <= max_z {
-                        out.push(s);
-                    }
-                }
+        for s in self.plan.iter() {
+            let f = s.radius + BLEND;
+            if s.x + f >= min_x && s.x - f <= max_x && s.z + f >= min_z && s.z - f <= max_z {
+                out.push(*s);
             }
         }
         out
@@ -323,8 +321,9 @@ fn village_houses(site: &Site) -> Vec<House> {
         let r = 17.0 + rng.f() * 5.0;
         let hx = site.x + (a.cos() * r).round() as i32;
         let hz = site.z + (a.sin() * r).round() as i32;
-        let w = if rng.below(2) == 0 { 7 } else { 9 };
-        let d = 7;
+        // Kích thước đa dạng như Veloren (nhà hẹp/rộng); số nhà rút trước nên `village_fields` vẫn khớp
+        let w = [7, 9, 11][rng.below(3) as usize];
+        let d = if rng.below(2) == 0 { 7 } else { 9 };
         let dx = site.x - hx;
         let dz = site.z - hz;
         let door = if dx.abs() >= dz.abs() {
@@ -402,7 +401,7 @@ fn build_village(chunk: &mut ChunkData, ox: i32, oz: i32, site: &Site, props: &m
 
     // Dân làng ở quảng trường: 3-5 người, mỗi người một nghề
     const SPOTS: [(i32, i32); 5] = [(0, 2), (2, -1), (-2, -1), (-3, 2), (3, 2)];
-    const JOBS: [Profession; 7] = [
+    const JOBS: [Profession; 13] = [
         Profession::Merchant,
         Profession::Blacksmith,
         Profession::Alchemist,
@@ -410,12 +409,19 @@ fn build_village(chunk: &mut ChunkData, ox: i32, oz: i32, site: &Site, props: &m
         Profession::Guard,
         Profession::Cook,
         Profession::Hunter,
+        Profession::Miner,
+        Profession::Fisherman,
+        Profession::Scholar,
+        Profession::Priest,
+        Profession::Bard,
+        Profession::Noble,
     ];
-    let n = 3 + ((site.seed >> 5) % 3) as usize;
+    // Thị trấn trung tâm luôn đông đủ 5 người; làng thường 3-5 người
+    let n = if site.tier == 0 { 5 } else { 3 + ((site.seed >> 5) % 3) as usize };
     for i in 0..n {
         let (dx, dz) = SPOTS[i];
         let vs = hash2(site.x + dx, site.z + dz, site.seed);
-        let job = JOBS[(i + site.seed as usize) % JOBS.len()];
+        let job = JOBS[(i * 5 + (site.seed >> 3) as usize) % JOBS.len()];
         add_villager(
             props, ox, oz,
             (site.x + dx) as f32 + 0.5, y, (site.z + dz) as f32 + 0.5,
@@ -612,8 +618,16 @@ fn build_field(
     add_sprite(props, ox, oz, sprite("hay/hay"), (px + 7) as f32 + 0.5, y, pz as f32 + 0.5, 0.0);
 }
 
+/// Nhà kiểu Veloren (`world/src/site/plot/house.rs`), bản đơn giản hoá cho khối 1x1:
+/// * móng đá + một hàng đá chân tường, khung dầm gỗ sẫm (cột góc, cột giữa, xà ngang) với tường trát vữa
+///   ("half-timber"); cửa sổ có bậu đá; khung cửa ra vào bằng dầm;
+/// * nhà 2 tầng: tầng dưới xây đá, tầng trên trát vữa và **đua ra 1 ô** hai bên mái (overhang), có dầm sàn lộ ra;
+/// * mái hai dốc 45° chạy theo cạnh dài, dày 2 lớp, **chìa mái 1 ô** quanh nhà, hai đầu hồi trát vữa có cột giữa;
+///   màu mái ngẫu nhiên (ngói đỏ / xanh dương / xanh lá / rơm);
+/// * ống khói đá gắn vào đầu hồi, nhô lên khỏi nóc.
 fn build_house(chunk: &mut ChunkData, ox: i32, oz: i32, by: i32, h: &House, props: &mut Vec<PropSpawnData>) {
-    const WALL_H: i32 = 4;
+    use BlockType as B;
+    let hh = hash2(h.x0, h.z0, 0x6f75_7365);
     let hx = (h.x0 + h.x1) / 2;
     let hz = (h.z0 + h.z1) / 2;
     let door_cell = match h.door {
@@ -623,42 +637,136 @@ fn build_house(chunk: &mut ChunkData, ox: i32, oz: i32, by: i32, h: &House, prop
         _ => (hx, h.z0),
     };
 
-    for x in h.x0..=h.x1 {
-        for z in h.z0..=h.z1 {
-            let edge_x = x == h.x0 || x == h.x1;
-            let edge_z = z == h.z0 || z == h.z1;
-            // Sàn + dọn khoảng trống bên trong
-            set_world(chunk, ox, oz, x, by, z, BlockType::Planks);
-            for y in 1..=WALL_H {
-                set_world(chunk, ox, oz, x, by + y, z, BlockType::Air);
+    // Hệ toạ độ cục bộ: u chạy dọc nóc mái (cạnh dài), v chạy ngang mái
+    let ridge_x = (h.x1 - h.x0) >= (h.z1 - h.z0);
+    let (u0, u1, v0, v1) = if ridge_x { (h.x0, h.x1, h.z0, h.z1) } else { (h.z0, h.z1, h.x0, h.x1) };
+    let to_world = |u: i32, v: i32| if ridge_x { (u, v) } else { (v, u) };
+    let mut put = |u: i32, v: i32, y: i32, b: BlockType| {
+        let (x, z) = to_world(u, v);
+        set_world(chunk, ox, oz, x, y, z, b);
+    };
+
+    // Số tầng: nhà rộng có 1/3 cơ hội 2 tầng (không xây cao khi nền đã sát trần thế giới)
+    let two = (h.x1 - h.x0) >= 8 && hh % 3 == 0 && by + 18 < CHUNK_SIZE_Y as i32;
+    const H1: i32 = 4; // tầng dưới: y = by+1 ..= by+4 (by+4 là xà)
+    const H2: i32 = 4;
+    let top = by + if two { H1 + H2 } else { H1 };
+    let oh = if two { 1 } else { 0 }; // tầng trên đua ra theo trục v
+    let roof = [B::RoofTile, B::RoofTileBlue, B::RoofTileGreen, B::Thatch][((hh >> 4) % 4) as usize];
+    let door_uv = if ridge_x { door_cell } else { (door_cell.1, door_cell.0) };
+
+    // Móng + sàn + dọn trống bên trong (cả gác mái)
+    let roof_lo = v0 - oh - 1;
+    let roof_hi = v1 + oh + 1;
+    let half = (roof_hi - roof_lo) / 2;
+    for u in (u0 - 1)..=(u1 + 1) {
+        for v in roof_lo..=roof_hi {
+            for y in (by + 1)..=(top + half + 2) {
+                put(u, v, y, B::Air);
             }
-            if !(edge_x || edge_z) {
-                continue;
-            }
-            let corner = edge_x && edge_z;
-            let along = if edge_z { x - h.x0 } else { z - h.z0 };
-            let near_door = (x - door_cell.0).abs() + (z - door_cell.1).abs() <= 1;
-            for y in 1..=WALL_H {
-                let mut b = if corner { BlockType::Wood } else { BlockType::Planks };
-                if (x, z) == door_cell && y <= 3 {
-                    b = BlockType::Air; // cửa ra vào cao 3 khối (bộ va chạm cần 3 ô trống)
-                } else if !corner && !near_door && y == 2 && along % 3 == 2 {
-                    b = BlockType::Air; // cửa sổ
+        }
+    }
+    for u in u0..=u1 {
+        for v in v0..=v1 {
+            let edge = u == u0 || u == u1 || v == v0 || v == v1;
+            put(u, v, by, if edge { B::Cobble } else { B::Planks });
+            if edge {
+                for y in (by - 3)..by {
+                    put(u, v, y, B::Cobble);
                 }
-                set_world(chunk, ox, oz, x, by + y, z, b);
             }
         }
     }
 
-    // Mái chữ A, đỉnh nóc chạy dọc trục X
-    let half = (h.z1 - h.z0) / 2 + 1;
-    for k in 0..=half {
-        let y = by + WALL_H + 1 + k;
-        for x in (h.x0 - 1)..=(h.x1 + 1) {
-            for dz in -(half - k)..=(half - k) {
-                set_world(chunk, ox, oz, x, y, hz + dz, BlockType::RoofTile);
+    // Tường một tầng: chân đá, khung dầm, ô tường `fill`, cửa sổ cách 4 ô
+    let wall = |put: &mut dyn FnMut(i32, i32, i32, BlockType),
+                    a0: i32, a1: i32, b0: i32, b1: i32, y0: i32, h: i32, fill: BlockType, stone_base: bool, lower: bool| {
+        for u in a0..=a1 {
+            for v in b0..=b1 {
+                let eu = u == a0 || u == a1;
+                let ev = v == b0 || v == b1;
+                if !(eu || ev) {
+                    continue;
+                }
+                let corner = eu && ev;
+                let along = if ev { u - a0 } else { v - b0 };
+                let len = if ev { a1 - a0 } else { b1 - b0 };
+                let is_door = lower && (u, v) == door_uv;
+                let near_door = lower && (u - door_uv.0).abs() + (v - door_uv.1).abs() == 1;
+                let post = corner || along % 4 == 0 || along == len;
+                for dy in 1..=h {
+                    let y = y0 + dy;
+                    let mut b = if dy == h {
+                        B::DarkWood // xà ngang
+                    } else if post {
+                        B::DarkWood
+                    } else if dy == 1 && stone_base {
+                        B::Cobble
+                    } else {
+                        fill
+                    };
+                    if is_door && dy < h {
+                        b = B::Air; // cửa cao 3 ô
+                    } else if near_door && dy < h {
+                        b = B::DarkWood; // khung cửa
+                    } else if !post && !near_door && along % 4 == 2 && (dy == 2 || dy == 3) && dy < h {
+                        b = B::Air; // cửa sổ 1x2
+                    }
+                    put(u, v, y, b);
+                }
             }
         }
+    };
+    let lower_fill = if two { B::Cobble } else { B::Plaster };
+    wall(&mut put, u0, u1, v0, v1, by, H1, lower_fill, true, true);
+    if two {
+        // Dầm sàn tầng trên: lộ ra ở phần đua, bên trong là ván
+        for u in u0..=u1 {
+            for v in (v0 - oh)..=(v1 + oh) {
+                let inside = v > v0 && v < v1 && u > u0 && u < u1;
+                put(u, v, by + H1, if inside { B::Planks } else { B::DarkWood });
+            }
+        }
+        wall(&mut put, u0, u1, v0 - oh, v1 + oh, by + H1, H2, B::Plaster, false, false);
+    }
+
+    // Mái hai dốc dày 2 lớp + chìa mái; đầu hồi trát vữa với cột giữa
+    let vc2 = roof_lo + roof_hi; // 2 * tâm
+    for k in 0..=half {
+        let y = top + 1 + k;
+        let a = roof_lo + k;
+        let b = roof_hi - k;
+        for u in (u0 - 1)..=(u1 + 1) {
+            for v in [a, a + 1, b - 1, b] {
+                if v >= a && v <= b {
+                    put(u, v, y, roof);
+                }
+            }
+        }
+        for u in [u0, u1] {
+            for v in (a + 2)..=(b - 2) {
+                let b_ = if 2 * v == vc2 { B::DarkWood } else { B::Plaster };
+                put(u, v, y, b_);
+            }
+        }
+    }
+
+    // Ống khói đá ở đầu hồi u0, lệch khỏi tâm (tránh cửa)
+    let cv = v1 - 1;
+    let chimney_top = top + 1 + half + 1;
+    for y in (by + 1)..=chimney_top {
+        put(u0, cv, y, B::Cobble);
+    }
+
+    // Lối đi lát đá trước cửa
+    let (dx, dz) = match h.door {
+        0 => (1, 0),
+        1 => (-1, 0),
+        2 => (0, 1),
+        _ => (0, -1),
+    };
+    for i in 1..=2 {
+        set_world(chunk, ox, oz, door_cell.0 + dx * i, by, door_cell.1 + dz * i, B::Cobble);
     }
 
     // Nội thất: giường, bàn, rương

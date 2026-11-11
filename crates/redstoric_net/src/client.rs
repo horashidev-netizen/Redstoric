@@ -39,6 +39,8 @@ const SMOOTHING: f32 = 15.0;
 pub struct NetConfig {
     pub server: Option<SocketAddr>,
     pub name: String,
+    /// Khoá tài khoản bí mật (`account_key.txt`), gửi cho server khi vào.
+    pub key: String,
 }
 
 impl NetConfig {
@@ -66,8 +68,26 @@ impl NetConfig {
                 }
             }
         });
-        Self { server, name: name.unwrap_or_else(|| "Player".to_string()) }
+        Self { server, name: name.unwrap_or_else(|| "Player".to_string()), key: load_or_create_key() }
     }
+}
+
+/// Đọc khoá tài khoản từ `account_key.txt`; chưa có thì sinh mới và ghi lại.
+/// Không ghi được file (ví dụ thư mục chỉ đọc) thì dùng khoá tạm cho phiên này.
+/// Mất file này là mất quyền vào nhân vật đã lưu: nhớ sao lưu.
+fn load_or_create_key() -> String {
+    const FILE: &str = "account_key.txt";
+    if let Ok(text) = std::fs::read_to_string(FILE) {
+        let text = text.trim().to_string();
+        if redstoric_store::is_valid_key(&text) {
+            return text;
+        }
+    }
+    let key = redstoric_store::generate_key();
+    if let Err(err) = std::fs::write(FILE, &key) {
+        bevy::log::warn!("Không ghi được {FILE} ({err}): tiến độ chỉ lưu theo khoá tạm của phiên này");
+    }
+    key
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -122,6 +142,7 @@ impl Plugin for NetClientPlugin {
         // Không kết nối thì không khởi tạo client QUIC (tránh tạo luồng tokio thừa)
         let offline = config.server.is_none();
         app.add_plugins(QuinnetClientPlugin { initialize_later: offline })
+            .add_plugins(crate::chat::ChatPlugin)
             .insert_resource(config)
             .init_resource::<NetClient>()
             .add_systems(Startup, (connect_on_start, setup_status_ui).run_if(resource_exists::<QuinnetClient>))
@@ -136,9 +157,12 @@ impl Plugin for NetClientPlugin {
                     send_fx,
                     update_remote_weapons,
                     send_appearance,
+                    crate::progress::apply_pending_progress,
+                    crate::progress::send_progress,
                     update_status_ui,
                 )
                     .chain()
+                    .in_set(redstoric_core::GameSet::Net)
                     .run_if(resource_exists::<QuinnetClient>),
             );
     }
@@ -202,7 +226,7 @@ fn handle_connection_events(
         if let Some(conn) = client.get_connection_mut() {
             conn.try_send_message_on(
                 CH_RELIABLE,
-                ClientMsg::Hello { version: PROTOCOL_VERSION, name: config.name.clone(), appearance },
+                ClientMsg::Hello { version: PROTOCOL_VERSION, name: config.name.clone(), appearance, key: config.key.clone() },
             );
         }
     }
@@ -236,6 +260,7 @@ fn handle_server_messages(
     mut weather: ResMut<Weather>,
     mut env_sync: ResMut<EnvSync>,
     fx_assets: Option<Res<FxAssets>>,
+    mut chat: ResMut<crate::chat::ChatLog>,
 ) {
     let mut inbox: Vec<ServerMsg> = Vec::new();
     {
@@ -249,7 +274,8 @@ fn handle_server_messages(
 
     for msg in inbox {
         match msg {
-            ServerMsg::Welcome { your_id, seed } => {
+            ServerMsg::Welcome { your_id, seed, progress } => {
+                commands.insert_resource(crate::progress::PendingProgress(progress));
                 net.my_id = Some(your_id);
                 net.status = NetStatus::Online;
                 online.0 = true;
@@ -271,6 +297,7 @@ fn handle_server_messages(
                     continue;
                 }
                 info!("{name} (#{id}) đã vào");
+                chat.push(format!("* {name} joined the game"));
                 let entity = spawn_remote(&mut commands, &mut meshes, &mut materials, id, &name);
                 net.remote.insert(id, entity);
             }
@@ -281,6 +308,9 @@ fn handle_server_messages(
             }
             // Ngoại hình người khác đã nhận nhưng hiện chưa dùng: người chơi từ xa còn là mô hình tạm.
             ServerMsg::PlayerAppearance { .. } => {}
+            ServerMsg::Chat { name, text, .. } => {
+                chat.push(format!("{name}: {}", crate::chat::sanitize_chat(&text)));
+            }
             ServerMsg::Env { hour, rain } => {
                 tod.hour = hour.rem_euclid(24.0);
                 weather.target = rain.clamp(0.0, 1.0);

@@ -97,6 +97,11 @@ fn get_block_base_color(block: BlockType) -> [f32; 4] {
         BlockType::Farmland => [0.30, 0.19, 0.11, 1.0],   // Đất ruộng
         BlockType::Wheat => [0.85, 0.72, 0.22, 1.0],      // Lúa mì chín
         BlockType::Rice => [0.55, 0.80, 0.30, 1.0],       // Lúa non
+        BlockType::Plaster => [0.86, 0.80, 0.68, 1.0],    // Tường vữa
+        BlockType::DarkWood => [0.24, 0.15, 0.08, 1.0],   // Dầm gỗ sẫm
+        BlockType::RoofTileBlue => [0.22, 0.32, 0.50, 1.0], // Ngói xanh dương
+        BlockType::RoofTileGreen => [0.26, 0.42, 0.24, 1.0], // Ngói xanh lá
+        BlockType::Thatch => [0.72, 0.58, 0.30, 1.0],     // Mái rơm
         BlockType::Air => [0.0, 0.0, 0.0, 0.0],
     }
 }

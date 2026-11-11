@@ -1,0 +1,10 @@
+[package]
+name = "redstoric_protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Thông điệp client <-> server (bincode qua QUIC). Không phụ thuộc đồ hoạ nên server chạy được trên máy yếu / điện thoại."
+
+[dependencies]
+bevy_quinnet = { workspace = true }
+serde = { version = "1.0.229", features = ["derive"] }
+redstoric_common = { path = "../redstoric_common" }

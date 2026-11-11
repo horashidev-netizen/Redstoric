@@ -7,8 +7,14 @@
 use std::collections::HashSet;
 
 use bevy::prelude::*;
+use redstoric_common::bosses::BossKind;
+use redstoric_common::structures::SiteKind;
+use redstoric_common::WorldGenerator;
+use redstoric_core::character_creator::MODEL_SCALE;
 use redstoric_core::Character;
 use redstoric_voxel::{BossSpawnPoint, VoxelWorldMap};
+
+use crate::boss_models::{BossModel, Limb, CYCLOPS, MINOTAUR, OGRE, TROLL_MOUNTAIN, YETI};
 
 use crate::types::{Health, HitFlash, Knockback};
 
@@ -48,6 +54,46 @@ pub struct Boss {
     pub home: Vec3,
     pub key: IVec2,
     pub state: BossState,
+    pub kind: BossKind,
+}
+
+/// Trạng thái hoạt ảnh đi/đánh của boss dùng model glb.
+#[derive(Component)]
+pub struct BossAnim {
+    pub phase: f32,
+    pub last: Vec3,
+    pub speed: f32,
+}
+
+/// Khớp chi (tay/chân) của boss glb; hoạt ảnh xoay khớp này.
+#[derive(Component)]
+pub struct BossLimb {
+    pub owner: Entity,
+    pub limb: Limb,
+}
+
+fn model_of(kind: BossKind) -> Option<&'static BossModel> {
+    match kind {
+        BossKind::Guardian => None,
+        BossKind::Ogre => Some(&OGRE),
+        BossKind::Minotaur => Some(&MINOTAUR),
+        BossKind::Yeti => Some(&YETI),
+        BossKind::TrollMountain => Some(&TROLL_MOUNTAIN),
+        BossKind::Cyclops => Some(&CYCLOPS),
+    }
+}
+
+/// Loại boss của đấu trường chứa điểm `home` (theo bậc trong `WorldPlan`).
+fn kind_at(generator: Option<&WorldGenerator>, home: Vec3) -> BossKind {
+    let Some(g) = generator else {
+        return BossKind::Guardian;
+    };
+    let (x, z) = (home.x.floor() as i32, home.z.floor() as i32);
+    g.sites_in_area(x - 12, z - 12, x + 12, z + 12)
+        .into_iter()
+        .find(|s| s.kind == SiteKind::BossArena && s.dist(x, z) <= 12.0)
+        .map(|s| BossKind::for_tier(s.tier, s.seed))
+        .unwrap_or(BossKind::Guardian)
 }
 
 #[derive(Component)]
@@ -61,6 +107,8 @@ pub fn boss_spawn_system(
     spawn_points: Query<&BossSpawnPoint, Added<BossSpawnPoint>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    assets: Res<AssetServer>,
+    generator: Option<Res<WorldGenerator>>,
 ) {
     for point in &spawn_points {
         let home = point.home;
@@ -69,6 +117,13 @@ pub fn boss_spawn_system(
             continue;
         }
         registry.alive.insert(key);
+        let kind = kind_at(generator.as_deref(), home);
+
+        // Boss người khổng lồ dựng từ các mảnh glb của Veloren
+        if let Some(model) = model_of(kind) {
+            spawn_glb_boss(&mut commands, &assets, home, key, kind, model);
+            continue;
+        }
 
         let body_mat = materials.add(StandardMaterial {
             base_color: BODY_COLOR,
@@ -92,10 +147,10 @@ pub fn boss_spawn_system(
             .spawn((
                 Transform::from_translation(home),
                 Visibility::default(),
-                Boss { home, key, state: BossState::Idle },
+                Boss { home, key, state: BossState::Idle, kind },
                 BossVisual { material: body_mat.clone() },
-                Health::new(BOSS_HEALTH),
-                Name::new("Obsidian Guardian"),
+                Health::new(BOSS_HEALTH * kind.hp_mult()),
+                Name::new(kind.name()),
             ))
             .with_children(|b| {
                 let m = |mesh: &Handle<Mesh>, x: f32, y: f32, z: f32| {
@@ -120,14 +175,116 @@ pub fn boss_spawn_system(
     }
 }
 
+fn spawn_glb_boss(
+    commands: &mut Commands,
+    assets: &AssetServer,
+    home: Vec3,
+    key: IVec2,
+    kind: BossKind,
+    model: &BossModel,
+) {
+    let root = commands
+        .spawn((
+            Transform::from_translation(home),
+            Visibility::default(),
+            Boss { home, key, state: BossState::Idle, kind },
+            BossAnim { phase: 0.0, last: home, speed: 0.0 },
+            Health::new(BOSS_HEALTH * kind.hp_mult()),
+            Name::new(kind.name()),
+        ))
+        .id();
+    let scale = MODEL_SCALE * kind.scale();
+    let body = commands.spawn((Transform::from_scale(Vec3::splat(scale)), Visibility::default())).id();
+    commands.entity(root).add_child(body);
+
+    // Khớp tay/chân: thứ tự khớp với `BossModel::pivots`
+    let limbs = [Limb::ArmL, Limb::ArmR, Limb::LegL, Limb::LegR];
+    let mut pivot_ids: Vec<Entity> = Vec::with_capacity(4);
+    for (i, limb) in limbs.iter().enumerate() {
+        let id = commands
+            .spawn((
+                Transform::from_translation(Vec3::from(model.pivots[i])),
+                Visibility::default(),
+                BossLimb { owner: root, limb: *limb },
+            ))
+            .id();
+        commands.entity(body).add_child(id);
+        pivot_ids.push(id);
+    }
+    for part in model.parts {
+        let parent = match part.limb {
+            Limb::Body => body,
+            Limb::ArmL => pivot_ids[0],
+            Limb::ArmR => pivot_ids[1],
+            Limb::LegL => pivot_ids[2],
+            Limb::LegR => pivot_ids[3],
+        };
+        let handle = assets.load(GltfAssetLabel::Scene(0).from_asset(format!("placeholders/glb/npc/{}", part.glb)));
+        commands.entity(parent).with_children(|c| {
+            c.spawn((WorldAssetRoot(handle), Transform::from_translation(Vec3::from(part.pos))));
+        });
+    }
+}
+
+/// Hoạt ảnh boss glb: đi (tay chân đảo nhau), giơ tay lấy đà, bổ xuống khi nghỉ; dọn Knockback/HitFlash.
+pub fn boss_limb_animation(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut bosses: Query<(Entity, &Boss, &Transform, &mut BossAnim, Option<&mut HitFlash>, Option<&Knockback>)>,
+    mut limbs: Query<(&BossLimb, &mut Transform), Without<Boss>>,
+) {
+    let dt = time.delta_secs().max(1e-4);
+    for (entity, boss, tf, mut anim, flash, knockback) in &mut bosses {
+        if knockback.is_some() {
+            commands.entity(entity).remove::<Knockback>();
+        }
+        if let Some(mut flash) = flash {
+            flash.timer -= dt;
+            if flash.timer <= 0.0 {
+                commands.entity(entity).remove::<HitFlash>();
+            }
+        }
+        let moved = Vec3::new(tf.translation.x - anim.last.x, 0.0, tf.translation.z - anim.last.z).length();
+        anim.last = tf.translation;
+        let speed = (moved / dt).min(12.0);
+        anim.speed += (speed - anim.speed) * (dt * 8.0).min(1.0);
+        anim.phase += anim.speed * dt * 0.9;
+        let swing = (anim.speed / 4.0).min(1.0) * 0.65;
+        let walk = anim.phase.sin() * swing;
+
+        let windup_total = WINDUP * boss.kind.windup_mult();
+        let arm_pitch = match boss.state {
+            BossState::Windup(t) => -(1.0 - (t / windup_total).clamp(0.0, 1.0)) * 2.4,
+            BossState::Recover(t) => 0.7 * (t / RECOVER).clamp(0.0, 1.0),
+            _ => 0.0,
+        };
+        let attacking = matches!(boss.state, BossState::Windup(_) | BossState::Recover(_));
+
+        for (limb, mut ltf) in &mut limbs {
+            if limb.owner != entity {
+                continue;
+            }
+            let pitch = match limb.limb {
+                Limb::ArmL => if attacking { arm_pitch } else { -walk },
+                Limb::ArmR => if attacking { arm_pitch } else { walk },
+                Limb::LegL => walk,
+                Limb::LegR => -walk,
+                Limb::Body => 0.0,
+            };
+            ltf.rotation = Quat::from_rotation_x(pitch);
+        }
+    }
+}
+
 pub fn boss_ai_system(
     time: Res<Time>,
     map: Option<Res<VoxelWorldMap>>,
-    mut player: Query<(&Transform, &mut Health), (With<Character>, Without<Boss>)>,
+    mut player: Query<(&Transform, &mut Health, &Character), Without<Boss>>,
     mut bosses: Query<(&mut Boss, &mut Transform, &mut Health), Without<Character>>,
 ) {
     let Some(map) = map else { return };
-    let Ok((player_tf, mut player_health)) = player.single_mut() else { return };
+    let Ok((player_tf, mut player_health, pch)) = player.single_mut() else { return };
+    let dodging = pch.rolling();
     let dt = time.delta_secs();
 
     for (mut boss, mut tf, mut health) in &mut bosses {
@@ -138,6 +295,8 @@ pub fn boss_ai_system(
             boss.state = BossState::Dying(DEATH_TIME);
             continue;
         }
+        let kind = boss.kind;
+        let atk_range = ATTACK_RANGE * kind.range_mult();
         let pos = tf.translation;
         let chunk = (
             (pos.x / 16.0).floor() as i32,
@@ -167,8 +326,8 @@ pub fn boss_ai_system(
             BossState::Chase => {
                 if player_from_home >= LEASH_RANGE {
                     BossState::Idle
-                } else if dist <= ATTACK_RANGE - 0.4 {
-                    BossState::Windup(WINDUP)
+                } else if dist <= atk_range - 0.4 {
+                    BossState::Windup(WINDUP * kind.windup_mult())
                 } else {
                     BossState::Chase
                 }
@@ -176,8 +335,8 @@ pub fn boss_ai_system(
             BossState::Windup(t) => {
                 let t = t - dt;
                 if t <= 0.0 {
-                    if dist <= ATTACK_RANGE + 0.6 {
-                        player_health.current = (player_health.current - ATTACK_DAMAGE).max(0.0);
+                    if dist <= atk_range + 0.6 && !dodging {
+                        player_health.current = (player_health.current - ATTACK_DAMAGE * kind.damage_mult()).max(0.0);
                     }
                     BossState::Recover(RECOVER)
                 } else {
@@ -200,8 +359,8 @@ pub fn boss_ai_system(
         // Di chuyển: đuổi người chơi, hoặc quay về tâm khi rảnh
         let to_home = Vec3::new(boss.home.x - pos.x, 0.0, boss.home.z - pos.z);
         let (dir, speed) = match boss.state {
-            BossState::Chase => (to_player.normalize_or_zero(), SPEED),
-            BossState::Idle if to_home.length() > 1.5 => (to_home.normalize_or_zero(), SPEED * 0.6),
+            BossState::Chase => (to_player.normalize_or_zero(), SPEED * kind.speed_mult()),
+            BossState::Idle if to_home.length() > 1.5 => (to_home.normalize_or_zero(), SPEED * kind.speed_mult() * 0.6),
             _ => (Vec3::ZERO, 0.0),
         };
         if dir != Vec3::ZERO {

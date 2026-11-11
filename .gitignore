@@ -14,6 +14,7 @@ project_dump.md
 # ── File backup khi chỉnh sửa ──
 *.bak
 *.bak[0-9]*
+*.bak_*
 *.orig
 *.rej
 *.swp
@@ -51,3 +52,5 @@ saves/
 Thumbs.db
 desktop.ini
 assets
+account_key.txt
+server_data/

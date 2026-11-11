@@ -139,3 +139,17 @@ fn weapon_equip_system(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_stats_match_weapon_table() {
+        use redstoric_common::rules::weapons::STATS;
+        assert_eq!(STATS.len(), WEAPONS.len());
+        for (s, w) in STATS.iter().zip(WEAPONS.iter()) {
+            assert_eq!((s.duration, s.damage, s.range), (w.duration, w.damage, w.range), "{}", w.class);
+        }
+    }
+}

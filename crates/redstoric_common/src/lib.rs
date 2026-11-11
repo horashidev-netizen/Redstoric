@@ -9,11 +9,13 @@
 //! | [`block`], [`chunk`] | Loại khối và dữ liệu chunk |
 //! | [`generation`], [`worldgen`] | Sinh địa hình, khí hậu, hang động, cây |
 //! | [`structures`] | Làng, đấu trường boss |
+//! | [`worldplan`] | Bố cục thế giới có chủ đích: thị trấn trung tâm, làng, đấu trường theo bậc khó |
 //! | [`sprites`], [`prop`] | Danh mục sprite và dữ liệu prop |
 //! | [`npc`] | Tên, nghề, lời thoại và hàng hoá của dân làng |
 //! | [`rules`] | Hằng số cân bằng game (boss, người chơi, giới hạn server) |
 
 pub mod block;
+pub mod bosses;
 pub mod chunk;
 pub mod fauna;
 pub mod generation;
@@ -24,6 +26,7 @@ pub mod rules;
 pub mod sprites;
 pub mod structures;
 pub mod worldgen;
+pub mod worldplan;
 
 pub use block::BlockType;
 pub use chunk::{ChunkData, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z};

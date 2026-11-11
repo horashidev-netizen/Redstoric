@@ -34,7 +34,7 @@ pub struct GameAudioPlugin;
 
 impl Plugin for GameAudioPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Mix>().init_resource::<AudioRng>().add_systems(Startup, spawn_loops).add_systems(
+        app.init_resource::<Mix>().init_resource::<AudioRng>().insert_resource(VoiceBank::scan()).add_systems(Startup, spawn_loops).add_systems(Update, npc_voice_system).add_systems(
             Update,
             (
                 toggle_mute,
@@ -97,6 +97,95 @@ struct AmbientLoop(LoopKind);
 
 #[derive(Component)]
 struct Music;
+
+/// Các file giọng nói có sẵn: (thư mục giọng, id) -> đường dẫn asset.
+/// Quét `assets/audio/voice/<m|f>_<young|adult|old>/` (và `m/`, `f/` kiểu cũ) lúc khởi động.
+#[derive(Resource, Default)]
+struct VoiceBank(HashMap<(String, String), String>);
+
+const VOICE_AGES: [&str; 3] = ["young", "adult", "old"];
+
+impl VoiceBank {
+    fn scan() -> Self {
+        let mut map = HashMap::new();
+        let mut roots = vec![std::path::PathBuf::from("assets/audio/voice")];
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("assets/audio/voice"))) {
+            roots.push(dir);
+        }
+        let Some(root) = roots.into_iter().find(|p| p.is_dir()) else {
+            return Self(map);
+        };
+        for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let Ok(voice) = dir.file_name().into_string() else { continue };
+            if !dir.path().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+                let Ok(name) = entry.file_name().into_string() else { continue };
+                let Some((stem, ext)) = name.rsplit_once('.') else { continue };
+                if matches!(ext, "ogg" | "wav" | "mp3") {
+                    map.insert((voice.clone(), stem.to_lowercase()), format!("audio/voice/{voice}/{name}"));
+                }
+            }
+        }
+        info!("Giọng nói NPC: tìm thấy {} file", map.len());
+        Self(map)
+    }
+
+    /// Ưu tiên đúng giới + đúng tuổi; rồi cùng giới tuổi gần nhất; rồi thư mục `m`/`f` kiểu cũ; cuối cùng giới còn lại.
+    fn find(&self, female: bool, age: u8, id: &str) -> Option<&String> {
+        let age = age.min(2) as usize;
+        let order: [usize; 3] = match age {
+            0 => [0, 1, 2],
+            1 => [1, 0, 2],
+            _ => [2, 1, 0],
+        };
+        for sex in if female { ["f", "m"] } else { ["m", "f"] } {
+            for a in order {
+                if let Some(p) = self.0.get(&(format!("{sex}_{}", VOICE_AGES[a]), id.to_string())) {
+                    return Some(p);
+                }
+            }
+            if let Some(p) = self.0.get(&(sex.to_string(), id.to_string())) {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
+/// Phát các câu NPC vừa nói (nếu có file). Âm lượng giảm theo khoảng cách; mỗi NPC chỉ nói một câu một lúc.
+fn npc_voice_system(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mix: Res<Mix>,
+    bank: Res<VoiceBank>,
+    mut queue: ResMut<redstoric_core::voice::VoiceQueue>,
+    player: Query<(&Transform, &Character)>,
+    mut playing: Local<HashMap<u32, Entity>>,
+) {
+    if queue.0.is_empty() {
+        return;
+    }
+    let ppos = player_pos(&player);
+    for line in queue.0.drain(..) {
+        let id = redstoric_core::voice::voice_id(&line.key);
+        let Some(rel) = bank.find(line.female, line.age, &id) else { continue };
+        let d = ppos.map_or(0.0, |p| p.distance(line.pos));
+        let vol = mix.master * (1.0 - d / 28.0).clamp(0.0, 1.0);
+        if vol < 0.02 {
+            continue;
+        }
+        if let Some(old) = playing.remove(&line.owner) {
+            commands.entity(old).try_despawn();
+        }
+        let handle: Handle<AudioSource> = assets.load(rel.clone());
+        let e = commands
+            .spawn((AudioPlayer::<AudioSource>(handle), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(vol))))
+            .id();
+        playing.insert(line.owner, e);
+    }
+}
 
 fn play(commands: &mut Commands, assets: &AssetServer, rel: &str, vol: f32) {
     if vol < 0.01 {

@@ -23,6 +23,14 @@ pub enum BlockType {
     Farmland,
     Wheat,
     Rice,
+    /// Tường trát vữa (daub) của nhà kiểu Veloren
+    Plaster,
+    /// Gỗ dầm sẫm màu (khung nhà, xà ngang)
+    DarkWood,
+    RoofTileBlue,
+    RoofTileGreen,
+    /// Mái rơm
+    Thatch,
 }
 
 impl BlockType {
@@ -67,6 +75,11 @@ impl BlockType {
                 BlockType::Farmland => [0.30, 0.19, 0.11, 1.0],
                 BlockType::Wheat => [0.85, 0.72, 0.22, 1.0],
                 BlockType::Rice => [0.55, 0.80, 0.30, 1.0],
+                BlockType::Plaster => [0.86, 0.80, 0.68, 1.0],
+                BlockType::DarkWood => [0.24, 0.15, 0.08, 1.0],
+                BlockType::RoofTileBlue => [0.22, 0.32, 0.50, 1.0],
+                BlockType::RoofTileGreen => [0.26, 0.42, 0.24, 1.0],
+                BlockType::Thatch => [0.72, 0.58, 0.30, 1.0],
             },
         }
     }

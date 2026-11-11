@@ -91,6 +91,14 @@ pub struct CharacterAppearance {
     pub class: usize,
     /// Đã xác nhận chức nghiệp (khoá, không đổi nữa)
     pub class_chosen: bool,
+    /// Bộ trang phục (`outfits::OUTFITS`, 1-based); 0 = bộ thân mặc định. Dùng cho dân làng.
+    pub outfit: usize,
+    /// Màu nhân lên các mảnh (model Veloren chỉ chứa màu placeholder xám/trắng). `[1,1,1]` = giữ nguyên.
+    pub hair_tint: [f32; 3],
+    pub skin_tint: [f32; 3],
+    pub cloth_tint: [f32; 3],
+    /// Vũ khí của dân làng (đường dẫn trong `placeholders/glb/`), cất đi cho tới khi nổi giận.
+    pub npc_weapon: Option<String>,
 }
 
 impl Default for CharacterAppearance {
@@ -104,6 +112,11 @@ impl Default for CharacterAppearance {
             accessory: 0,
             class: 0,
             class_chosen: false,
+            outfit: 0,
+            hair_tint: [1.0; 3],
+            skin_tint: [1.0; 3],
+            cloth_tint: [1.0; 3],
+            npc_weapon: None,
         }
     }
 }
@@ -155,7 +168,43 @@ impl AppearanceCatalog {
         let hair = next(lists.hair.len() + 1);
         let beard = if !female && next(3) == 0 { next(lists.beard.len() + 1) } else { 0 };
         let eyes = next(lists.eyes.len());
-        CharacterAppearance { species, female, hair, beard, eyes, accessory: 0, ..Default::default() }
+        // Màu tóc / da / áo ngẫu nhiên (ổn định theo seed)
+        const HAIR: [[f32; 3]; 10] = [
+            [0.10, 0.09, 0.09], // đen
+            [0.28, 0.17, 0.10], // nâu đậm
+            [0.45, 0.28, 0.14], // nâu
+            [0.56, 0.22, 0.12], // nâu đỏ
+            [0.92, 0.78, 0.40], // vàng
+            [0.82, 0.36, 0.12], // gừng
+            [0.62, 0.62, 0.65], // xám
+            [0.95, 0.95, 0.97], // trắng
+            [0.55, 0.65, 0.95], // xanh nhạt (hơi huyền ảo)
+            [0.80, 0.55, 0.85], // tím nhạt
+        ];
+        const SKIN: [[f32; 3]; 6] = [
+            [1.00, 1.00, 1.00],
+            [0.97, 0.91, 0.86],
+            [0.88, 0.76, 0.62],
+            [0.72, 0.55, 0.40],
+            [0.55, 0.40, 0.30],
+            [0.40, 0.29, 0.22],
+        ];
+        const CLOTH: [[f32; 3]; 8] = [
+            [0.85, 0.25, 0.22], // đỏ
+            [0.25, 0.45, 0.85], // xanh dương
+            [0.30, 0.70, 0.35], // xanh lá
+            [0.92, 0.80, 0.25], // vàng
+            [0.60, 0.35, 0.75], // tím
+            [0.55, 0.38, 0.22], // nâu
+            [0.20, 0.65, 0.65], // xanh ngọc
+            [0.95, 0.55, 0.20], // cam
+        ];
+        let hair_tint = HAIR[next(HAIR.len())];
+        let skin_tint = SKIN[next(SKIN.len())];
+        let cloth = CLOTH[next(CLOTH.len())];
+        // Áo giữ phần lớn màu gốc của bộ giáp: chỉ ngả nhẹ sang màu đã chọn
+        let cloth_tint = [0.45 + cloth[0] * 0.55, 0.45 + cloth[1] * 0.55, 0.45 + cloth[2] * 0.55];
+        CharacterAppearance { species, female, hair, beard, eyes, accessory: 0, hair_tint, skin_tint, cloth_tint, ..Default::default() }
     }
 
     fn get(&self, species: Species, female: bool) -> PartLists {
@@ -334,10 +383,18 @@ pub fn spawn_humanoid(
         asset_server.load(GltfAssetLabel::Scene(0).from_asset(format!("placeholders/glb/{rel}")))
     };
 
-    let pants = load(format!("figure/body/pants_{sex}.glb"));
-    let belt = load(format!("figure/body/belt_{sex}.glb"));
-    let chest = load(format!("figure/body/chest_{sex}.glb"));
-    let foot = load("figure/body/foot.glb".to_string());
+    // Trang phục: nếu có bộ giáp thì thay các mảnh mà bộ đó có, mảnh khác giữ bản mặc định
+    let outfit = appearance.outfit.checked_sub(1).and_then(|i| crate::outfits::OUTFITS.get(i));
+    let pick = |part: &str, has: fn(&crate::outfits::Outfit) -> bool, fallback: String| {
+        load(match outfit {
+            Some(o) if has(o) => format!("armor/{}/{part}.glb", o.dir),
+            _ => fallback,
+        })
+    };
+    let pants = pick("pants", |o| o.pants, format!("figure/body/pants_{sex}.glb"));
+    let belt = pick("belt", |o| o.belt, format!("figure/body/belt_{sex}.glb"));
+    let chest = pick("chest", |o| o.chest, format!("figure/body/chest_{sex}.glb"));
+    let foot = pick("foot", |o| o.foot, "figure/body/foot.glb".to_string());
     let hand = load("figure/body/hand.glb".to_string());
     let head = load(format!("figure/head/{}/{sex}.glb", appearance.species.dir()));
     let hair = appearance.hair.checked_sub(1).and_then(|i| lists.hair.get(i)).map(|p| load(format!("figure/{p}")));
@@ -348,16 +405,29 @@ pub fn spawn_humanoid(
         .checked_sub(1)
         .and_then(|i| lists.accessory.get(i))
         .map(|p| load(format!("figure/{p}")));
-    let weapon = is_player.then(|| load("weapon/sword/caladbolg.glb".to_string()));
+    let weapon = if is_player {
+        Some(load("weapon/sword/caladbolg.glb".to_string()))
+    } else {
+        appearance.npc_weapon.clone().map(load)
+    };
+    let hair_c = Color::srgb(appearance.hair_tint[0], appearance.hair_tint[1], appearance.hair_tint[2]);
+    let skin_c = Color::srgb(appearance.skin_tint[0], appearance.skin_tint[1], appearance.skin_tint[2]);
+    let cloth_c = Color::srgb(appearance.cloth_tint[0], appearance.cloth_tint[1], appearance.cloth_tint[2]);
+    let hair_on = appearance.hair_tint != [1.0; 3];
+    let skin_on = appearance.skin_tint != [1.0; 3];
+    let cloth_on = appearance.cloth_tint != [1.0; 3];
 
+    // Hoạt ảnh dùng chung (người chơi + NPC); chèn lại khi dựng lại model để tìm lại khớp
+    commands.entity(parent).insert(AnimDriver::default());
     commands.entity(parent).with_children(|root| {
-        let mut body_root = root.spawn((Transform::from_scale(Vec3::splat(MODEL_SCALE)), Visibility::default()));
+        let mut body_root = root.spawn((Transform::from_scale(Vec3::splat(MODEL_SCALE)), Visibility::default(), Limb::Body));
         if is_player {
             body_root.insert(HumanoidRoot);
         }
         body_root.with_children(|body| {
             // Hông + thắt lưng (đứng yên theo thân)
-            body.spawn((WorldAssetRoot(pants), Transform::from_xyz(0.0, layout::PANTS_Y, 0.0)));
+            body.spawn((WorldAssetRoot(pants), Transform::from_xyz(0.0, layout::PANTS_Y, 0.0)))
+                .insert_if(PartTint(cloth_c), || cloth_on);
             body.spawn((WorldAssetRoot(belt), Transform::from_xyz(0.0, layout::BELT_Y, 0.0)));
 
             // Chân (bàn chân là phần chân của model "chibi"), xoay quanh khớp hông
@@ -367,6 +437,7 @@ pub fn spawn_humanoid(
                 Visibility::default(),
             ))
             .insert_if(BoneLegLeft, || is_player)
+            .insert(Limb::LegL)
             .with_children(|leg| {
                 leg.spawn((WorldAssetRoot(foot.clone()), Transform::from_xyz(fx, fy, fz)));
             });
@@ -375,6 +446,7 @@ pub fn spawn_humanoid(
                 Visibility::default(),
             ))
             .insert_if(BoneLegRight, || is_player)
+            .insert(Limb::LegR)
             .with_children(|leg| {
                 leg.spawn((WorldAssetRoot(foot), Transform::from_xyz(fx, fy, fz)));
             });
@@ -385,8 +457,10 @@ pub fn spawn_humanoid(
                 Visibility::default(),
             ))
             .insert_if(BoneChest, || is_player)
+            .insert(Limb::Chest)
             .with_children(|c| {
-                c.spawn((WorldAssetRoot(chest), Transform::IDENTITY));
+                c.spawn((WorldAssetRoot(chest), Transform::IDENTITY))
+                    .insert_if(PartTint(cloth_c), || cloth_on);
 
                 // Đầu và các mảnh gắn trên đầu
                 c.spawn((
@@ -394,10 +468,13 @@ pub fn spawn_humanoid(
                     Visibility::default(),
                 ))
                 .insert_if(BoneHead, || is_player)
+                .insert(Limb::Head)
                 .with_children(|h| {
-                    h.spawn((WorldAssetRoot(head), Transform::IDENTITY));
+                    h.spawn((WorldAssetRoot(head), Transform::IDENTITY))
+                        .insert_if(PartTint(skin_c), || skin_on);
                     if let Some(scene) = hair {
-                        h.spawn((WorldAssetRoot(scene), Transform::IDENTITY));
+                        h.spawn((WorldAssetRoot(scene), Transform::IDENTITY))
+                            .insert_if(PartTint(hair_c), || hair_on);
                     }
                     if let Some(scene) = eyes {
                         let (x, y, z) = layout::EYES;
@@ -405,7 +482,8 @@ pub fn spawn_humanoid(
                     }
                     if let Some(scene) = beard {
                         let (x, y, z) = layout::BEARD;
-                        h.spawn((WorldAssetRoot(scene), Transform::from_xyz(x, y, z)));
+                        h.spawn((WorldAssetRoot(scene), Transform::from_xyz(x, y, z)))
+                            .insert_if(PartTint(hair_c), || hair_on);
                     }
                     if let Some(scene) = accessory {
                         let (x, y, z) = layout::ACCESSORY;
@@ -419,12 +497,14 @@ pub fn spawn_humanoid(
                     Visibility::default(),
                 ))
                 .insert_if(BoneShoulderLeft, || is_player)
+                .insert(Limb::ShoulderL)
                 .with_children(|sh| {
                     sh.spawn((
                         WorldAssetRoot(hand.clone()),
                         Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
                     ))
-                    .insert_if(BoneHandLeft, || is_player);
+                    .insert_if(BoneHandLeft, || is_player)
+                    .insert_if(PartTint(skin_c), || skin_on);
                 });
 
                 // Tay phải cầm kiếm
@@ -433,6 +513,8 @@ pub fn spawn_humanoid(
                     Visibility::default(),
                 ))
                 .insert_if(BoneShoulderRight, || is_player)
+                .insert(Limb::ShoulderR)
+                .insert_if(NpcArmRight, || !is_player)
                 .with_children(|sh| {
                     sh.spawn((
                         Transform::from_xyz(0.0, layout::HAND_Y, 0.0),
@@ -440,14 +522,25 @@ pub fn spawn_humanoid(
                     ))
                     .insert_if(BoneHandRight, || is_player)
                     .with_children(|hand_node| {
-                        hand_node.spawn((WorldAssetRoot(hand), Transform::IDENTITY));
+                        hand_node.spawn((WorldAssetRoot(hand), Transform::IDENTITY))
+                            .insert_if(PartTint(skin_c), || skin_on);
                         if let Some(weapon) = weapon {
                             let (x, y, z) = layout::WEAPON;
-                            hand_node.spawn((
-                                WorldAssetRoot(weapon),
-                                Transform::from_xyz(x, y, z),
-                                WeaponHand,
-                            ));
+                            if is_player {
+                                hand_node.spawn((
+                                    WorldAssetRoot(weapon),
+                                    Transform::from_xyz(x, y, z),
+                                    WeaponHand,
+                                ));
+                            } else {
+                                // Không gắn `WeaponHand`: hệ thống đổi vũ khí/hoạt ảnh của người chơi dùng nhãn đó
+                                hand_node.spawn((
+                                    WorldAssetRoot(weapon),
+                                    Transform::from_xyz(x, y, z),
+                                    Visibility::Hidden,
+                                    NpcWeapon,
+                                ));
+                            }
                         }
                     });
                 });
@@ -495,6 +588,67 @@ enum CreatorAction {
 #[derive(Component)]
 struct FieldText(Field);
 
+/// Màu nhân lên mọi mesh của scene con (model Veloren chỉ có màu placeholder; màu thật chọn lúc chạy).
+#[derive(Component)]
+pub struct PartTint(pub Color);
+
+#[derive(Component)]
+struct TintApplied;
+
+/// Vũ khí trên tay dân làng (ẩn cho tới khi nổi giận).
+#[derive(Component)]
+pub struct NpcWeapon;
+
+/// Vai phải của dân làng (để vung vũ khí).
+#[derive(Component)]
+pub struct NpcArmRight;
+
+/// Khi scene glb của một mảnh đã dựng xong thì nhân màu `PartTint` vào bản sao riêng của từng material
+/// (không sửa material dùng chung nên các NPC khác không bị đổi màu).
+fn apply_part_tints(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    roots: Query<(Entity, &PartTint), Without<TintApplied>>,
+    children: Query<&Children>,
+    mut handles: Query<&mut MeshMaterial3d<StandardMaterial>>,
+    // Material đã nhuộm dùng chung theo (material gốc, màu): các NPC cùng màu chia sẻ một material nên
+    // GPU gộp được lệnh vẽ, thay vì mỗi NPC một bộ material riêng.
+    mut cache: Local<HashMap<(AssetId<StandardMaterial>, [u8; 3]), Handle<StandardMaterial>>>,
+) {
+    for (root, tint) in &roots {
+        let t = tint.0.to_linear();
+        let mut stack: Vec<Entity> = vec![root];
+        let mut changed = false;
+        while let Some(e) = stack.pop() {
+            if let Ok(mut handle) = handles.get_mut(e) {
+                let key = (handle.0.id(), [(t.red * 255.0) as u8, (t.green * 255.0) as u8, (t.blue * 255.0) as u8]);
+                if let Some(shared) = cache.get(&key) {
+                    handle.0 = shared.clone();
+                    changed = true;
+                } else if let Some(mut mat) = materials.get(&handle.0).cloned() {
+                    let c = mat.base_color.to_linear();
+                    mat.base_color = Color::linear_rgba(c.red * t.red, c.green * t.green, c.blue * t.blue, c.alpha);
+                    mat.alpha_mode = AlphaMode::Opaque;
+                    mat.cull_mode = None;
+                    mat.double_sided = true;
+                    let shared = materials.add(mat);
+                    cache.insert(key, shared.clone());
+                    handle.0 = shared;
+                    changed = true;
+                }
+            }
+            if let Ok(kids) = children.get(e) {
+                for kid in kids.iter() {
+                    stack.push(kid.clone());
+                }
+            }
+        }
+        if changed {
+            commands.entity(root).insert(TintApplied);
+        }
+    }
+}
+
 pub struct CharacterCreatorPlugin;
 
 impl Plugin for CharacterCreatorPlugin {
@@ -509,7 +663,8 @@ impl Plugin for CharacterCreatorPlugin {
             .add_systems(
                 Update,
                 (toggle_creator, handle_creator_buttons, refresh_creator, rebuild_humanoid).chain(),
-            );
+            )
+            .add_systems(Update, apply_part_tints);
     }
 }
 

@@ -36,6 +36,9 @@ pub struct WorldGenerator {
     species_noise: SuperSimplex,
 
     pub sea_level: usize,
+
+    /// Bố cục khu (thị trấn, làng, đấu trường) do `worldplan` lập từ seed.
+    pub(crate) plan: std::sync::Arc<Vec<crate::structures::Site>>,
 }
 
 impl WorldGenerator {
@@ -66,7 +69,16 @@ impl WorldGenerator {
             forest_noise: SuperSimplex::new(seed.wrapping_add(606)),
             species_noise: SuperSimplex::new(seed.wrapping_add(707)),
             sea_level: 16,
+            plan: std::sync::Arc::new(Vec::new()),
         }
+    }
+
+    /// Dựng generator kèm bố cục thế giới. Đây là hàm chính để dùng (thay cho `new` thuần địa hình).
+    pub fn with_plan(seed: u32) -> Self {
+        let mut generator = Self::new(seed);
+        let plan = crate::worldplan::generate_plan(&generator, seed);
+        generator.plan = std::sync::Arc::new(plan);
+        generator
     }
 
     /// Độ "đất liền" của một điểm: 0 = biển, 1 = lõi đảo. Thế giới là một hòn đảo hữu hạn

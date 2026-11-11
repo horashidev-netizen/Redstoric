@@ -25,7 +25,7 @@ impl Plugin for VoxelWorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<VoxelWorldMap>()
             .init_resource::<VoxelStreamSettings>()
-            .insert_resource(WorldGenerator::new(WORLD_SEED))
+            .insert_resource(WorldGenerator::with_plan(WORLD_SEED))
             .init_resource::<PreloadedProps>()
             .add_systems(Startup, (setup_voxel_world, start_preload))
             .add_systems(Update, (poll_preload, update_loading_screen).chain().run_if(resource_exists::<preload::WorldPreload>))

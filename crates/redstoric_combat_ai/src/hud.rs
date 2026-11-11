@@ -14,6 +14,8 @@ pub struct PlayerHpText;
 pub struct BossBarRoot;
 #[derive(Component)]
 pub struct BossBarFill;
+#[derive(Component)]
+pub struct BossNameText;
 
 fn label(text: &str, size: f32) -> (Text, TextFont, TextColor) {
     (
@@ -83,7 +85,7 @@ pub fn setup_hud(mut commands: Commands) {
             BossBarRoot,
         ))
         .with_children(|root| {
-            root.spawn(label("Obsidian Guardian", 18.0));
+            root.spawn((label("Obsidian Guardian", 18.0), BossNameText));
             root.spawn((
                 Node {
                     width: Val::Px(460.0),
@@ -114,6 +116,7 @@ pub fn update_hud(
     mut boss_fill: Query<&mut Node, (With<BossBarFill>, Without<PlayerBarFill>)>,
     mut hp_text: Query<&mut TextSpan, With<PlayerHpText>>,
     mut boss_root: Query<&mut Visibility, With<BossBarRoot>>,
+    mut boss_name: Query<&mut Text, With<BossNameText>>,
 ) {
     if let Ok(health) = player.single() {
         let pct = (health.current / health.max * 100.0).clamp(0.0, 100.0);
@@ -132,7 +135,12 @@ pub fn update_hud(
     for mut visibility in &mut boss_root {
         *visibility = if engaged.is_some() { Visibility::Inherited } else { Visibility::Hidden };
     }
-    if let Some((_, health)) = engaged {
+    if let Some((boss, health)) = engaged {
+        for mut name in &mut boss_name {
+            if name.0 != boss.kind.name() {
+                name.0 = boss.kind.name().to_string();
+            }
+        }
         let pct = (health.current / health.max * 100.0).clamp(0.0, 100.0);
         for mut node in &mut boss_fill {
             node.width = Val::Percent(pct);

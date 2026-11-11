@@ -160,9 +160,35 @@ pub(super) fn yaw_of(d: Vec2) -> f32 {
 struct Terrain<'a> {
     map: Option<&'a VoxelWorldMap>,
     wg: &'a WorldGenerator,
+    /// Làng gần người chơi: (tâm, bán kính cấm). Thú dữ không được bước vào.
+    villages: &'a [(Vec2, f32)],
+    /// Con vật này là thú dữ (bị chặn ở rìa làng)
+    avoid: bool,
+}
+
+/// Bán kính cấm thú dữ quanh tâm làng (vùng san phẳng của làng + lề).
+pub(crate) const VILLAGE_KEEP_OUT: f32 = 46.0;
+
+/// Các làng trong vòng `range` khối quanh `p`.
+pub(crate) fn villages_near(wg: &WorldGenerator, p: Vec3, range: i32) -> Vec<(Vec2, f32)> {
+    let (x, z) = (p.x as i32, p.z as i32);
+    wg.sites_in_area(x - range, z - range, x + range, z + range)
+        .into_iter()
+        .filter(|s| s.kind == redstoric_common::structures::SiteKind::Village)
+        .map(|s| (Vec2::new(s.x as f32 + 0.5, s.z as f32 + 0.5), (s.radius as f32 + 2.0).max(VILLAGE_KEEP_OUT)))
+        .collect()
 }
 
 impl Terrain<'_> {
+    /// Thú dữ không được đi sâu vào làng; đang ở trong thì chỉ được đi ra.
+    fn village_blocked(&self, from: Vec2, to: Vec2) -> bool {
+        self.avoid
+            && self.villages.iter().any(|(c, r)| {
+                let dt = to.distance(*c);
+                dt <= *r && dt < from.distance(*c)
+            })
+    }
+
     fn ground_y(&self, x: f32, z: f32, y: f32) -> f32 {
         match self.map {
             Some(m) => m.get_walk_height(x, z, y).0,
@@ -201,6 +227,9 @@ fn step(ter: &Terrain, p: &mut Vec3, dir: Vec2, speed: f32, dt: f32, tries: &[f3
     for &a in tries {
         let d = Vec2::from_angle(a).rotate(dir);
         let n = Vec2::new(p.x, p.z) + d * speed * dt;
+        if ter.village_blocked(Vec2::new(p.x, p.z), n) {
+            continue;
+        }
         if ter.walkable(n.x, n.y, p.y).is_some() {
             p.x = n.x;
             p.z = n.y;
@@ -308,6 +337,7 @@ fn fauna_spawn_system(
         return;
     }
     let period = DayPeriod::from_hour(tod.map(|t| t.hour).unwrap_or(9.0));
+    let villages = villages_near(&wg, pp, (SPAWN_CHUNKS + 2) * CHUNK_SIZE_X as i32);
 
     // Chunk gần người chơi được xét trước
     let mut todo: Vec<(i32, IVec2)> = Vec::new();
@@ -331,6 +361,12 @@ fn fauna_spawn_system(
             }
             // Không sinh sát mặt người chơi
             if Vec2::new(s.x - pp.x, s.z - pp.z).length() < 12.0 {
+                continue;
+            }
+            // Thú dữ không sinh trong làng
+            if s.species.alignment() == Alignment::Enemy
+                && villages.iter().any(|(vc, r)| Vec2::new(s.x, s.z).distance(*vc) <= *r + 8.0)
+            {
                 continue;
             }
             let y = wg.get_surface_height(s.x as f64, s.z as f64) as f32 + 1.0;
@@ -363,15 +399,24 @@ fn fauna_ai_system(
         (Entity, &Animal, &mut Agent, &mut Transform, &Health, Option<&mut Knockback>, Option<&mut HitFlash>),
         Without<Character>,
     >,
+    mut vcache: Local<(f32, Vec<(Vec2, f32)>)>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let Ok((ptf, pchar, mut phealth)) = player.single_mut() else { return; };
     let ppos = ptf.translation;
-    let ter = Terrain { map: map.as_deref(), wg: &*wg };
+    // Danh sách làng gần đây: làm mới mỗi giây thay vì mỗi khung hình
+    vcache.0 -= dt;
+    if vcache.0 <= 0.0 {
+        vcache.0 = 1.0;
+        vcache.1 = villages_near(&wg, ppos, 220);
+    }
+    let villages: &[(Vec2, f32)] = &vcache.1;
+    let ter_base = Terrain { map: map.as_deref(), wg: &*wg, villages, avoid: false };
     let mut pack_alerts: Vec<(u32, Vec3)> = Vec::new();
 
     for (entity, animal, mut ag, mut tf, health, kb, flash) in &mut animals {
         let sp = animal.species;
+        let ter = Terrain { avoid: sp.alignment() == Alignment::Enemy, ..ter_base };
         let psy = ag.psyche;
         let mut p = tf.translation;
 
@@ -584,7 +629,7 @@ fn fauna_ai_system(
                 face = Some(dir2);
                 ag.state_t += dt;
                 if ag.state_t >= rules::BITE_WINDUP {
-                    if dist <= rules::BITE_RANGE + 0.9 && !online.0 {
+                    if dist <= rules::BITE_RANGE + 0.9 && !online.0 && !pchar.rolling() {
                         phealth.current = (phealth.current - sp.bite_damage()).max(0.0);
                     }
                     ag.mood = Mood::Recover;
