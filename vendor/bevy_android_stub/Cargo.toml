@@ -1,0 +1,5 @@
+[package]
+name = "bevy_android"
+version = "0.20.1"
+edition = "2024"
+description = "Bản rỗng thay bevy_android chỉ để build server dòng lệnh trên Termux (Android). KHÔNG dùng cho APK game."

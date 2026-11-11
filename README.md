@@ -597,7 +597,8 @@ cargo run --release -p redstoric_server -- --port 6000 --data server_data
 # Trên điện thoại (Termux, cài từ F-Droid)
 pkg update && pkg install rust clang git
 git clone <repo của bạn> Redstoric && cd Redstoric
-cargo build --release -p redstoric_server        # lần đầu ~15-30 phút
+cargo build --release -p redstoric_server \
+  --config 'patch.crates-io.bevy_android.path="vendor/bevy_android_stub"'   # lần đầu ~15-30 phút
 termux-wake-lock                                  # giữ máy khỏi ngủ
 ./target/release/redstoric_server --port 6000 --data ~/server_data
 ```
@@ -605,3 +606,5 @@ termux-wake-lock                                  # giữ máy khỏi ngủ
 Client cùng Wi-Fi: `Redstoric --connect <IP điện thoại>:6000 --name Tam` (xem IP bằng `ip addr` / `ifconfig` trong Termux).
 Chơi qua Internet: dùng Tailscale (cài trên cả hai máy) thay vì mở cổng, vì mạng di động thường dùng CGNAT. Cổng là **UDP** 6000.
 Android có thể giết tiến trình nền: tắt tối ưu pin cho Termux. Dữ liệu tự lưu mỗi 30 giây nên bị giết cũng chỉ mất tối đa 30 giây.
+
+> Vì sao có `--config ...bevy_android_stub`: trên Android, Bevy bắt buộc có một backend Activity (dành cho APK) nên build dòng lệnh trong Termux báo lỗi `android-activity`. Cờ này thay `bevy_android` bằng một crate rỗng (`vendor/bevy_android_stub`) **chỉ cho lệnh build đó**; build APK game không bị ảnh hưởng. Chỉ dùng cho server.
